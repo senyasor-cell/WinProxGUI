@@ -60,8 +60,8 @@ Build the command tree automatically, configure options with a rich dialog, and 
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourname/proxmark3-gui-commander.git
-   cd proxmark3-gui-commander
+   git clone https://github.com/senyasor-cell/WinProxGUI.git
+   cd WinProxGUI
 Create a virtual environment (optional)
 
 bash
@@ -72,7 +72,7 @@ Install dependencies – the only requirement is tkinter, which is included with
 Run the application
 
 bash
-python pm3_gui.py
+python pm3.py
 Quick Start
 Ensure your Proxmark3 is connected and appears as a COM port (e.g., COM9).
 
