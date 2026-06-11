@@ -53,7 +53,7 @@ Build the command tree automatically, configure options with a rich dialog, and 
 
 - **Windows** (the GUI is built with `tkinter` and uses `wmic` for port detection).
 - **Python 3.8 or newer** (the Proxmark3 client itself requires its own environment, but the GUI only needs a standard Python installation).
-- A working **Proxmark3 client** – you need a folder that contains `client/proxmark3.exe` and the `libs` subfolder (i.e. the Iceman fork or any official build).
+- A working **Proxmark3 client** – you need a folder that contains `client/proxmark3.exe` and the `libs` subfolder (i.e. the Iceman fork or any official build https://www.proxmarkbuilds.org/latest/rrg_other.php).
 
 ### Steps
 
