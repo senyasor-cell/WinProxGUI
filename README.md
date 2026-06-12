@@ -1,7 +1,6 @@
 # WinProxGUI
 Universal GUI for Proxmark3
 # Proxmark3 GUI Commander
-![Proxmark3 GUI Commander](gui.png)
 
 A modern graphical interface for the [Proxmark3 RFID instrument](https://github.com/RfidResearchGroup/proxmark3) on Windows.  
 Build the command tree automatically, configure options with a rich dialog, and never type a long command again.
