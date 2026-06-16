@@ -48,7 +48,7 @@ https://www.proxmarkbuilds.org/latest/rrg_other.php
 Clone the repository or download the ZIP archive:
 
 bash
-git clone https://github.com/yourname/proxmark3-gui-commander.git
+git clone https://github.com/senyasor-cell/WinProxGUI
 cd proxmark3-gui-commander
 All dependencies are part of the standard Python library (tkinter, subprocess, threading, json, re, etc.) – no extra installations needed.
 
