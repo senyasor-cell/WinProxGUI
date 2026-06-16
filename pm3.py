@@ -20,7 +20,9 @@ def load_config():
         "pm3_folder": "",
         "com_port": "COM9",
         "encoding": "utf-8",
-        "last_path": ""
+        "last_path": "",
+        "last_full_command": "",
+        "append_exit": False
     }
     try:
         if os.path.exists(get_user_path(CONFIG_FILENAME)):
@@ -78,7 +80,6 @@ def save_options_cache(options):
 
 # ----------------------------- Find COM Ports -----------------------------
 def get_available_com_ports():
-    """Возвращает список доступных COM-портов в Windows."""
     ports = []
     try:
         result = subprocess.run(
@@ -96,7 +97,7 @@ def get_available_com_ports():
         pass
     return sorted(ports, key=lambda x: int(re.search(r'\d+', x).group()))
 
-# ----------------------------- Proxmark Commander (batch mode) -----------------------------
+# ----------------------------- Proxmark Batch Commander -----------------------------
 class ProxmarkBatch:
     def __init__(self, client_folder, com_port, encoding='utf-8'):
         self.client_folder = client_folder
@@ -128,7 +129,7 @@ class ProxmarkBatch:
         env['MSYSTEM'] = 'MINGW64'
         return env
 
-    def run_command(self, cmd, timeout=30):
+    def run_command_batch(self, cmd, timeout=120):
         with self.lock:
             exe = self._find_proxmark_exe()
             if not exe:
@@ -156,134 +157,303 @@ class ProxmarkBatch:
                 return f"[ERROR] {e}"
 
     def get_help(self, base_path=""):
-        cmd = f"{base_path} -h" if base_path else "-h"
-        return self.run_command(cmd, timeout=60)
+        cmd_h = f"{base_path} -h" if base_path else "-h"
+        output = self.run_command_batch(cmd_h, timeout=60)
+        if not re.search(r'(options\s*:|usage\s*:)', output, re.IGNORECASE):
+            output2 = self.run_command_batch(f"{base_path} h", timeout=60)
+            if re.search(r'(options\s*:|usage\s*:)', output2, re.IGNORECASE):
+                output = output2
+        return output
 
-# ----------------------------- Wiegand Format Chooser (Popup) -----------------------------
-class FormatChooser(tk.Toplevel):
-    def __init__(self, parent, formats, current_var):
-        super().__init__(parent)
-        self.title("Select Wiegand Format")
-        self.geometry("500x400")
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-        self.var = current_var
-        self.formats = formats
+# ----------------------------- GUI Application -----------------------------
+class ProxmarkApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Proxmark3 GUI Commander")
+        self.geometry("1200x700")
+        self.minsize(800, 500)
 
-        frame = ttk.Frame(self)
-        frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.tree = ttk.Treeview(frame, columns=("name", "desc"), show="headings")
-        self.tree.heading("name", text="Name")
-        self.tree.heading("desc", text="Description")
-        self.tree.column("name", width=120)
-        self.tree.column("desc", width=300)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        config = load_config()
+        self.pm3_folder = tk.StringVar(value=config.get("pm3_folder", ""))
+        self.com_port = tk.StringVar(value=config.get("com_port", "COM9"))
+        self.encoding_var = tk.StringVar(value=config.get("encoding", "utf-8"))
+        self.last_path = config.get("last_path", "")
+        self.last_full_command = config.get("last_full_command", "")
+        self.append_exit_var = tk.BooleanVar(value=config.get("append_exit", False))
 
-        for name, desc in sorted(self.formats, key=lambda x: x[0].lower()):
-            self.tree.insert("", "end", values=(name, desc))
+        self.batch = None
+        self.path_to_iid = {}
+        self.tree_building = False
+        self.wiegand_formats = []
+        self.wiegand_loaded = threading.Event()
+        self.tree_cache_loaded = False
+        self.options_cache = load_options_cache()
 
-        self.tree.bind("<Double-1>", self.on_select)
-        ttk.Button(self, text="Select", command=self.on_select).pack(pady=5)
-
-    def on_select(self, event=None):
-        sel = self.tree.selection()
-        if sel:
-            name = self.tree.item(sel[0])["values"][0]
-            self.var.set(name)
-            self.destroy()
-
-# ----------------------------- Command Options Dialog -----------------------------
-class CommandDialog(tk.Toplevel):
-    def __init__(self, parent, prox, command_path, wiegand_formats, update_manual_callback, saved_options=None):
-        super().__init__(parent)
-        self.prox = prox
-        self.command_path = command_path
-        self.wiegand_formats = wiegand_formats
-        self.update_manual = update_manual_callback
+        self.current_command_path = ""
         self.option_widgets = {}
-        self.saved_options = saved_options or {}
-        self.title(f"Options for {command_path}")
-        self.geometry("800x700")
-        self.resizable(True, True)
+        self.option_panel_content = None
+        self.command_running = False
 
-        ttk.Label(self, text=f"Command: {command_path}", font=('TkDefaultFont', 10, 'bold')).pack(pady=5)
+        self.create_widgets()
+        self.create_menu()
+        self.after(50, self.show_manual_input)
 
-        paned = ttk.PanedWindow(self, orient=tk.VERTICAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        if self.pm3_folder.get():
+            self.init_prox()
+            cached = load_tree_cache(self.pm3_folder.get())
+            if cached:
+                self.populate_tree_from_cache(cached)
+                self.tree_cache_loaded = True
+                self.status_var.set("Ready (cached tree)")
+                self.restore_last_state()
+            else:
+                self.build_tree()
 
-        opt_frame = ttk.Frame(paned)
-        paned.add(opt_frame, weight=3)
+    # ------------------------------------------------------------
+    def create_widgets(self):
+        main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main_paned.pack(fill=tk.BOTH, expand=True)
 
-        canvas = tk.Canvas(opt_frame, borderwidth=0, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(opt_frame, orient="vertical", command=canvas.yview)
-        self.option_frame = ttk.Frame(canvas)
-        self.option_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0,0), window=self.option_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        left_frame = ttk.Frame(main_paned)
+        main_paned.add(left_frame, weight=1)
 
-        self.status_label = ttk.Label(opt_frame, text="Loading options...", foreground="gray")
-        self.status_label.pack(pady=5)
+        com_frame = ttk.Frame(left_frame)
+        com_frame.pack(fill=tk.X, padx=5, pady=(5,0))
+        ttk.Label(com_frame, text="COM Port:").pack(side=tk.LEFT)
+        self.com_combo = ttk.Combobox(com_frame, textvariable=self.com_port, state="readonly", width=10)
+        self.com_combo.pack(side=tk.LEFT, padx=5)
+        self._update_combo_ports()
+        refresh_btn = ttk.Button(com_frame, text="\U0001F5D8", width=3, command=self.refresh_com_ports)
+        refresh_btn.pack(side=tk.LEFT)
+        self.com_combo.bind("<<ComboboxSelected>>", self.on_com_port_changed)
 
-        self.examples_frame = ttk.LabelFrame(paned, text="Examples / Notes (double-click to apply)")
-        paned.add(self.examples_frame, weight=2)
-        example_container = ttk.Frame(self.examples_frame)
-        example_container.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-        self.examples_tree = ttk.Treeview(example_container, columns=("command",), show="headings", height=6)
-        self.examples_tree.heading("command", text="Example")
-        self.examples_tree.column("command", width=700)
+        tree_header = ttk.Frame(left_frame)
+        tree_header.pack(fill=tk.X, padx=5, pady=(5,0))
+        ttk.Label(tree_header, text="Command Tree", font=('TkDefaultFont', 10, 'bold')).pack(side=tk.LEFT)
+        self.tree_refresh_btn = ttk.Button(tree_header, text="\U0001F5D8", width=3, command=self.build_tree)
+        self.tree_refresh_btn.pack(side=tk.RIGHT, padx=(0, 15))
+
+        # Контейнер для дерева – классическая сетка
+        tree_container = ttk.Frame(left_frame)
+        tree_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        tree_container.grid_rowconfigure(0, weight=1)
+        tree_container.grid_columnconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(tree_container, show='tree')
+        self.tree.grid(row=0, column=0, sticky='nsew')
+
+        v_scrollbar = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview)
+        v_scrollbar.grid(row=0, column=1, sticky='ns')
+        h_scrollbar = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL, command=self.tree.xview)
+        h_scrollbar.grid(row=1, column=0, sticky='ew')
+
+        self.tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+
+        self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
+        self.tree.bind('<Double-1>', self.on_tree_double_click)
+        self.tree.bind('<<TreeviewOpen>>', self.on_tree_open)
+        self.tree_menu = tk.Menu(self, tearoff=0)
+        self.tree_menu.add_command(label="Execute with options", command=self.execute_selected_command)
+        self.tree.bind('<Button-3>', self.show_context_menu)
+
+        # --- правая часть ---
+        right_frame = ttk.Frame(main_paned)
+        main_paned.add(right_frame, weight=3)
+
+        bottom_panel = ttk.Frame(right_frame)
+        bottom_panel.pack(side=tk.BOTTOM, fill=tk.X)
+
+        status_frame = ttk.Frame(bottom_panel, height=80)
+        status_frame.pack(fill=tk.X, padx=5, pady=(5,0))
+        status_frame.pack_propagate(False)
+        self.status_text = scrolledtext.ScrolledText(
+            status_frame, wrap=tk.WORD, font=('Consolas', 9), bg='lightyellow', state='normal', height=4
+        )
+        self.status_text.pack(fill=tk.BOTH, expand=True)
+
+        cmd_frame = ttk.Frame(bottom_panel, height=40)
+        cmd_frame.pack(fill=tk.X, padx=5, pady=5)
+        cmd_frame.pack_propagate(False)
+        ttk.Label(cmd_frame, text="Manual command:").pack(side=tk.LEFT)
+        self.cmd_entry = ttk.Entry(cmd_frame, font=('Consolas', 10))
+        self.cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.cmd_entry.bind('<Return>', lambda e: self.send_manual_command())
+        send_btn = ttk.Button(cmd_frame, text="\u25B6", width=3, command=self.send_manual_command)
+        send_btn.pack(side=tk.LEFT, padx=(0,5))
+        cmd_btn = ttk.Button(cmd_frame, text="cmd", width=4, command=self.open_cmd)
+        cmd_btn.pack(side=tk.LEFT, padx=(5,0))
+
+        self.right_paned = tk.PanedWindow(right_frame, orient=tk.VERTICAL, sashwidth=2, sashrelief=tk.RAISED)
+        self.right_paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.options_frame = ttk.Frame(self.right_paned)
+        self.right_paned.add(self.options_frame, height=300)
+
+        self.log_frame = ttk.Frame(self.right_paned)
+        self.right_paned.add(self.log_frame, height=300)
+        self.log_text = scrolledtext.ScrolledText(
+            self.log_frame, wrap=tk.WORD, state='normal',
+            font=('Consolas', 9), bg='black', fg='lightgreen', insertbackground='white'
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.status_var = tk.StringVar(value="Not connected")
+        ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(fill=tk.X, side=tk.BOTTOM)
+    # ------------------------------------------------------------
+
+    # ---------- cmd ----------
+    def open_cmd(self):
+        """Открывает cmd в папке Proxmark, запускает pm3.bat и вставляет команду без выполнения."""
+        folder = self.pm3_folder.get()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Proxmark folder not set.")
+            return
+        cmd_text = self.cmd_entry.get().strip()
+        if cmd_text:
+            vbs_path = os.path.join(folder, "_type_cmd.vbs")
+            try:
+                with open(vbs_path, 'w') as f:
+                    f.write('Set WshShell = WScript.CreateObject("WScript.Shell")\n')
+                    f.write('WScript.Sleep 2000\n')
+                    for ch in cmd_text:
+                        if ch in ('+', '^', '%', '~', '(', ')', '{', '}', '[', ']'):
+                            f.write(f'WshShell.SendKeys "{{{ch}}}"\n')
+                        else:
+                            f.write(f'WshShell.SendKeys "{ch}"\n')
+                        f.write('WScript.Sleep 10\n')
+                subprocess.Popen(['wscript.exe', vbs_path], creationflags=subprocess.CREATE_NO_WINDOW)
+            except Exception as e:
+                self.status_message(f"[WARN] VBScript error: {e}")
+        try:
+            subprocess.Popen(
+                ['cmd.exe', '/k', 'pm3.bat'],
+                cwd=folder,
+                creationflags=subprocess.CREATE_NEW_CONSOLE
+            )
+            self.status_message("[INFO] Команда отображена в консоли. Нажмите Enter для выполнения.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open cmd: {e}")
+
+    # ---------- Остальные методы (без изменений) ----------
+    def show_manual_input(self):
+        for widget in self.options_frame.winfo_children():
+            widget.destroy()
+        self.option_widgets = {}
+        self.current_command_path = ""
+        self.option_panel_content = None
+        if hasattr(self, 'right_paned'):
+            self.right_paned.paneconfigure(self.options_frame, height=0, minsize=0)
+            self.right_paned.paneconfigure(self.log_frame, minsize=100)
+
+    def load_command_options(self, command_path):
+        if not self.batch:
+            return
+        if not self.wiegand_loaded.is_set():
+            self.status_message("[WARN] Wiegand formats still loading...")
+            return
+        self.current_command_path = command_path
+        saved = self.options_cache.get(command_path, {})
+        for widget in self.options_frame.winfo_children():
+            widget.destroy()
+        self.option_widgets = {}
+
+        self.right_paned.paneconfigure(self.options_frame, height=400, minsize=200)
+
+        self.option_panel_content = ttk.Frame(self.options_frame)
+        self.option_panel_content.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(self.option_panel_content, text=f"Command: {command_path}", font=('TkDefaultFont', 10, 'bold')).pack(pady=5, anchor='w')
+
+        examples_frame = ttk.LabelFrame(self.option_panel_content, text="Examples / Notes (double-click to apply)")
+        examples_frame.pack(fill=tk.BOTH, expand=False, padx=5, pady=5)
+        self.examples_tree = ttk.Treeview(examples_frame, columns=("command",), show="tree", height=4)
+        self.examples_tree.column("#0", width=0, stretch=False)
+        self.examples_tree.column("command", width=400)
         self.examples_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ex_scroll = ttk.Scrollbar(example_container, orient=tk.VERTICAL, command=self.examples_tree.yview)
+        ex_scroll = ttk.Scrollbar(examples_frame, orient=tk.VERTICAL, command=self.examples_tree.yview)
         ex_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.examples_tree.configure(yscrollcommand=ex_scroll.set)
         self.examples_tree.bind("<Double-1>", self.on_example_double_click)
 
-        ttk.Button(self, text="Execute", command=self.execute_command).pack(pady=10)
+        opt_canvas = tk.Canvas(self.option_panel_content, borderwidth=0, highlightthickness=0)
+        opt_scroll = ttk.Scrollbar(self.option_panel_content, orient=tk.VERTICAL, command=opt_canvas.yview)
+        self.options_container = ttk.Frame(opt_canvas)
+        self.options_container.bind("<Configure>", lambda e: opt_canvas.configure(scrollregion=opt_canvas.bbox("all")))
+        opt_canvas.create_window((0,0), window=self.options_container, anchor="nw")
+        opt_canvas.configure(yscrollcommand=opt_scroll.set)
+        opt_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        opt_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.status_label = ttk.Label(self.option_panel_content, text="Loading options...", foreground="gray")
+        self.status_label.pack(pady=5)
 
         self.update_manual(command_path)
-        threading.Thread(target=self.load_options, daemon=True).start()
+        threading.Thread(target=self._load_options_thread, args=(command_path, saved), daemon=True).start()
 
-    def load_options(self):
+    def _load_options_thread(self, command_path, saved_options):
         try:
-            output = self.prox.run_command(f"{self.command_path} -h", timeout=30)
+            output = self.batch.get_help(command_path)
         except Exception as e:
-            self.after(0, self.show_error, f"Failed to get help: {e}")
+            self.after(0, self._show_error, f"Failed to get help: {e}")
             return
-        self.after(0, self.process_help, output)
+        self.after(0, self._process_options_help, output, saved_options)
 
-    def clean_text(self, text):
-        ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-        text = ansi_escape.sub('', text)
-        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
-        return text
-
-    def process_help(self, output):
+    def _process_options_help(self, output, saved_options):
         output = self.clean_text(output)
         lines = output.splitlines()
         opts_start = -1
+        usage_start = -1
+        usage_end = -1
         examples_start = -1
+
+        for i, line in enumerate(lines):
+            if re.search(r'^\s*usage\s*:', line.strip(), re.IGNORECASE):
+                usage_start = i
+                for j in range(i+1, len(lines)):
+                    if re.search(r'^[a-zA-Z].*:\s*$', lines[j].strip()):
+                        usage_end = j
+                        break
+                if usage_end == -1:
+                    usage_end = len(lines)
+                break
+
+        if usage_start != -1:
+            usage_lines = []
+            for i in range(usage_start+1, usage_end):
+                line = lines[i].strip()
+                if line:
+                    usage_lines.append(f"[USAGE] {line}")
+            usage_str = '\n'.join(usage_lines)
+            self.status_message(usage_str)
+
+        for i, line in enumerate(lines):
+            if re.search(r'examples', line, re.IGNORECASE):
+                examples_start = i + 1
+                break
+
+        if examples_start != -1:
+            examples_lines = []
+            for i in range(examples_start, len(lines)):
+                line = lines[i].strip()
+                if not line:
+                    break
+                examples_lines.append(line)
+            if examples_lines and 'pm3 -->' in examples_lines[-1]:
+                examples_lines.pop()
+            self.examples_tree.delete(*self.examples_tree.get_children())
+            for ex in examples_lines:
+                self.examples_tree.insert("", "end", values=(ex,))
+        else:
+            self.examples_tree.delete(*self.examples_tree.get_children())
+
         for i, line in enumerate(lines):
             if re.search(r'^\s*options\s*:', line.strip(), re.IGNORECASE):
                 opts_start = i
-            if re.search(r'^\s*examples/notes\s*:', line.strip(), re.IGNORECASE):
-                examples_start = i
                 break
 
         if opts_start == -1:
-            self.after(0, self.show_error, "Options section not found.")
+            self._show_error("Options section not found.")
             return
-
-        if examples_start != -1:
-            examples_lines = [line.strip() for line in lines[examples_start+1:] if line.strip()]
-            if examples_lines and 'pm3 -->' in examples_lines[-1]:
-                examples_lines.pop()
-            self.after(0, self.populate_examples, examples_lines)
-        else:
-            self.after(0, self.populate_examples, [])
 
         option_lines = []
         end = examples_start if examples_start != -1 else len(lines)
@@ -294,8 +464,12 @@ class CommandDialog(tk.Toplevel):
             option_lines.append(line)
 
         option_pattern = re.compile(
-            r'^\s*(?P<flag>-{1,2}[\w-]+)(?:,\s*(?P<alias>-{1,2}[\w-]+))?(?:\s+<(?P<type>\w+)>)?\s*(?P<desc>.*)$'
+            r'^\s*(?P<flag>-{0,2}[\w-]+)(?:,\s*(?P<alias>-{0,2}[\w-]+))?(?:\s+<(?P<type>\w+)>)?\s*(?P<desc>.*)$'
         )
+
+        for child in self.options_container.winfo_children():
+            child.destroy()
+
         for line in option_lines:
             match = option_pattern.match(line)
             if not match:
@@ -304,22 +478,30 @@ class CommandDialog(tk.Toplevel):
             alias = match.group('alias')
             opt_type = match.group('type')
             desc = match.group('desc').strip() if match.group('desc') else ""
-
-            if flag == '-h' or flag == '--help':
+            if flag.lower() in ('h', 'help', '-h', '--help'):
                 continue
+            self._create_option_widget(self.options_container, flag, alias, opt_type, desc)
 
-            self.after(0, self.create_option_widget, flag, alias, opt_type, desc)
-
+        if saved_options:
+            for flag, data in self.option_widgets.items():
+                kind = data[0]
+                var = data[1]
+                if flag in saved_options:
+                    saved_val = saved_options[flag]
+                    if kind == 'bool':
+                        var.set(bool(saved_val))
+                    elif kind == 'format':
+                        full_str = next((f"{n} ({d})" for n, d in self.wiegand_formats if n == saved_val), saved_val)
+                        if len(data) > 2 and isinstance(data[2], ttk.Combobox):
+                            data[2].set(full_str)
+                        var.set(str(saved_val))
+                    else:
+                        var.set(str(saved_val))
+        self.update_manual(self.build_command())
         self.status_label.config(text="Ready")
-        self.after(50, self.apply_saved_options)
 
-    def populate_examples(self, examples):
-        self.examples_tree.delete(*self.examples_tree.get_children())
-        for ex in examples:
-            self.examples_tree.insert("", "end", values=(ex,))
-
-    def create_option_widget(self, flag, alias, opt_type, desc):
-        frame = ttk.Frame(self.option_frame)
+    def _create_option_widget(self, parent, flag, alias, opt_type, desc):
+        frame = ttk.Frame(parent)
         frame.pack(fill='x', padx=5, pady=2)
 
         display = flag
@@ -335,15 +517,19 @@ class CommandDialog(tk.Toplevel):
             self.option_widgets[flag] = ('bool', var, cb)
         elif opt_type == 'format':
             var = tk.StringVar()
-            combo_frame = ttk.Frame(frame)
-            combo_frame.pack(side='left', padx=5)
-            entry = ttk.Entry(combo_frame, textvariable=var, width=25)
-            entry.pack(side='left')
-            entry.bind("<Button-1>", lambda e: self.choose_format(var))
-            entry.bind("<KeyRelease>", lambda e: self.update_manual(self.build_command()))
+            combo = ttk.Combobox(frame, textvariable=var, state="readonly", width=35)
+            combo['values'] = [f"{n} ({d})" for n, d in self.wiegand_formats]
+            combo.pack(side='left', padx=5)
+            def on_format_selected(event, v=var):
+                sel = v.get()
+                if sel:
+                    name = sel.split()[0]
+                    v.set(name)
+                    self.update_manual(self.build_command())
+            combo.bind("<<ComboboxSelected>>", on_format_selected)
             type_label = ttk.Label(frame, text="<format>", foreground='gray')
             type_label.pack(side='left', padx=5)
-            self.option_widgets[flag] = ('value', var, entry)
+            self.option_widgets[flag] = ('format', var, combo)
         else:
             var = tk.StringVar()
             entry = ttk.Entry(frame, textvariable=var, width=25)
@@ -357,30 +543,21 @@ class CommandDialog(tk.Toplevel):
             desc_label = ttk.Label(frame, text=desc, wraplength=250, foreground='gray')
             desc_label.pack(side='left', padx=5)
 
-    def apply_saved_options(self):
-        if not self.saved_options:
-            return
-        for flag, (kind, var, widget) in self.option_widgets.items():
-            if flag in self.saved_options:
-                saved_val = self.saved_options[flag]
-                if kind == 'bool':
-                    var.set(bool(saved_val))
-                else:
-                    var.set(str(saved_val))
-        self.update_manual(self.build_command())
-
-    def choose_format(self, var):
-        FormatChooser(self, self.wiegand_formats, var)
-
     def build_command(self):
-        args = [self.command_path]
-        for flag, (kind, var, *_) in self.option_widgets.items():
+        if not self.current_command_path:
+            return ""
+        args = [self.current_command_path]
+        for flag, data in self.option_widgets.items():
+            kind = data[0]
+            var = data[1]
             if kind == 'bool':
                 if var.get():
                     args.append(flag)
             else:
                 val = var.get().strip()
                 if val:
+                    if kind == 'format':
+                        val = val.split()[0]
                     args.append(flag)
                     args.append(val)
         return ' '.join(args)
@@ -389,6 +566,17 @@ class CommandDialog(tk.Toplevel):
         sel = self.examples_tree.selection()
         if not sel:
             return
+
+        for flag, data in self.option_widgets.items():
+            kind = data[0]
+            var = data[1]
+            if kind == 'bool':
+                var.set(False)
+            else:
+                var.set("")
+                if kind == 'format' and len(data) > 2 and isinstance(data[2], ttk.Combobox):
+                    data[2].set("")
+
         example = self.examples_tree.item(sel[0])['values'][0]
         cmd_part = example.split('->')[0].strip()
         parts = cmd_part.split()
@@ -399,130 +587,80 @@ class CommandDialog(tk.Toplevel):
         while i < len(parts):
             token = parts[i]
             if token in flags:
-                widget_type, var, widget = self.option_widgets[token]
-                if widget_type == 'bool':
+                data = self.option_widgets[token]
+                kind, var = data[0], data[1]
+                if kind == 'bool':
                     var.set(True)
                     i += 1
                 else:
                     i += 1
                     if i < len(parts):
-                        var.set(parts[i])
+                        val = parts[i]
+                        if kind == 'format':
+                            display_str = next((f"{n} ({d})" for n, d in self.wiegand_formats if n == val), val)
+                            if len(data) > 2 and isinstance(data[2], ttk.Combobox):
+                                data[2].set(display_str)
+                        var.set(val)
                         i += 1
             else:
                 i += 1
         self.update_manual(self.build_command())
 
-    def show_error(self, msg):
-        self.status_label.config(text=msg, foreground='red')
-
-    def execute_command(self):
-        cmd = self.build_command()
-        self.update_manual(cmd)
+    def apply_current_options(self):
+        if not self.current_command_path:
+            return
         current_options = {}
-        for flag, (kind, var, *_) in self.option_widgets.items():
-            current_options[flag] = var.get()
-        self.master.save_command_options(self.command_path, current_options)
-        self.destroy()
-        self.master.run_manual_command(cmd)
+        for flag, data in self.option_widgets.items():
+            current_options[flag] = data[1].get()
+        self.save_command_options(self.current_command_path, current_options)
 
-# ----------------------------- GUI Application -----------------------------
-class ProxmarkApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Proxmark3 GUI Commander")
-        self.geometry("1200x700")
-        self.minsize(800, 500)
+    def send_manual_command(self, event=None):
+        if self.option_widgets:
+            self.apply_current_options()
+            cmd = self.cmd_entry.get().strip()
+        else:
+            cmd = self.cmd_entry.get().strip()
+        if cmd:
+            self.last_full_command = cmd
+            self.save_current_config()
+            self.run_manual_command(cmd)
 
-        config = load_config()
-        self.pm3_folder = tk.StringVar(value=config.get("pm3_folder", ""))
-        self.com_port = tk.StringVar(value=config.get("com_port", "COM9"))
-        self.encoding_var = tk.StringVar(value=config.get("encoding", "utf-8"))
-        self.last_path = config.get("last_path", "")
+    def _show_error(self, msg):
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text=msg, foreground='red')
 
-        self.prox = None
-        self.path_to_iid = {}
-        self.tree_building = False
-        self.wiegand_formats = []
-        self.wiegand_loaded = threading.Event()
-        self.tree_cache_loaded = False
-        self.options_cache = load_options_cache()
+    def update_manual(self, cmd):
+        if hasattr(self, 'cmd_entry') and self.cmd_entry.winfo_exists():
+            self.cmd_entry.delete(0, tk.END)
+            self.cmd_entry.insert(0, cmd)
 
-        self.create_widgets()
-        self.create_menu()
+    def on_tree_double_click(self, event):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        full_path = selection[0]
+        if self.tree.get_children(selection[0]):
+            return
+        if not self.batch:
+            return
+        if not self.wiegand_loaded.is_set():
+            self.status_message("[WARN] Wiegand formats still loading...")
+            return
+        self.load_command_options(full_path)
 
-        # Восстановление последнего узла после загрузки дерева
-        if self.pm3_folder.get():
-            self.init_prox()
-            cached = load_tree_cache(self.pm3_folder.get())
-            if cached:
-                self.populate_tree_from_cache(cached)
-                self.tree_cache_loaded = True
-                self.status_var.set("Ready (cached tree)")
-                self.restore_last_path()
-            else:
-                self.build_tree()
-
-    def create_widgets(self):
-        main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        main_paned.pack(fill=tk.BOTH, expand=True)
-
-        # Левая панель
-        left_frame = ttk.Frame(main_paned)
-        main_paned.add(left_frame, weight=1)
-
-        # Строка выбора COM-порта
-        com_frame = ttk.Frame(left_frame)
-        com_frame.pack(fill=tk.X, padx=5, pady=(5,0))
-        ttk.Label(com_frame, text="COM Port:").pack(side=tk.LEFT)
-
-        self.com_combo = ttk.Combobox(com_frame, textvariable=self.com_port, state="readonly", width=10)
-        self.com_combo.pack(side=tk.LEFT, padx=5)
-        self._update_combo_ports()
-
-        # Кнопка обновления 🔄
-        refresh_btn = ttk.Button(com_frame, text="\U0001F5D8", width=3, command=self.refresh_com_ports)
-        refresh_btn.pack(side=tk.LEFT)
-
-        self.com_combo.bind("<<ComboboxSelected>>", self.on_com_port_changed)
-
-        ttk.Label(left_frame, text="Command Tree", font=('TkDefaultFont', 10, 'bold')).pack(pady=(5,0))
-        tree_container = ttk.Frame(left_frame)
-        tree_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.tree = ttk.Treeview(tree_container, show='tree')
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
-        self.tree.bind('<Double-1>', self.on_tree_double_click)
-        self.tree.bind('<<TreeviewOpen>>', self.on_tree_open)
-        self.tree_menu = tk.Menu(self, tearoff=0)
-        self.tree_menu.add_command(label="Execute with options", command=self.execute_selected_command)
-        self.tree.bind('<Button-3>', self.show_context_menu)
-
-        # Правая панель
-        right_frame = ttk.Frame(main_paned)
-        main_paned.add(right_frame, weight=3)
-        ttk.Label(right_frame, text="Session Log", font=('TkDefaultFont', 10, 'bold')).pack(pady=(5,0))
-        self.log_text = scrolledtext.ScrolledText(
-            right_frame, wrap=tk.WORD, state='normal',
-            font=('Consolas', 9), bg='black', fg='lightgreen', insertbackground='white'
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        cmd_frame = ttk.Frame(right_frame)
-        cmd_frame.pack(fill=tk.X, padx=5, pady=(0,5))
-        ttk.Label(cmd_frame, text="Manual command:").pack(side=tk.LEFT)
-        self.cmd_entry = ttk.Entry(cmd_frame, font=('Consolas', 10))
-        self.cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.cmd_entry.bind('<Return>', self.send_manual_command)
-        ttk.Button(cmd_frame, text="Send", command=self.send_manual_command).pack(side=tk.LEFT)
-
-        ttk.Button(right_frame, text="Build / Refresh Tree", command=self.build_tree).pack(pady=5)
-
-        self.status_var = tk.StringVar(value="Not connected")
-        ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(fill=tk.X, side=tk.BOTTOM)
+    def execute_selected_command(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        full_path = selection[0]
+        if self.tree.get_children(selection[0]):
+            return
+        if not self.batch:
+            return
+        if not self.wiegand_loaded.is_set():
+            self.status_message("[WARN] Wiegand formats still loading...")
+            return
+        self.load_command_options(full_path)
 
     def _update_combo_ports(self):
         ports = get_available_com_ports()
@@ -531,13 +669,17 @@ class ProxmarkApp(tk.Tk):
             self.com_port.set(ports[0])
 
     def refresh_com_ports(self):
-        """Заново опрашивает COM-порты и обновляет ComboBox."""
         self._update_combo_ports()
-        self.log_message("[INFO] COM port list refreshed.\n")
+        self.status_message("[INFO] COM port list refreshed.")
 
     def on_com_port_changed(self, event=None):
         new_port = self.com_port.get()
-        self.log_message(f"[INFO] COM port changed to {new_port}. Reconnecting...\n")
+        self.status_message(f"[INFO] COM port changed to {new_port}. Reconnecting...")
+        self.save_current_config()
+        self.init_prox()
+
+    def on_append_exit_changed(self):
+        self.status_message(f"[INFO] Append exit after command: {self.append_exit_var.get()}")
         self.save_current_config()
         self.init_prox()
 
@@ -551,6 +693,7 @@ class ProxmarkApp(tk.Tk):
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="Select Proxmark folder...", command=self.select_folder)
+        settings_menu.add_checkbutton(label="Append 'exit' after command", variable=self.append_exit_var, command=self.on_append_exit_changed)
         enc_menu = tk.Menu(settings_menu, tearoff=0)
         encodings = [
             ("UTF-8", "utf-8"), ("CP1251 (Windows Cyrillic)", "cp1251"),
@@ -564,7 +707,7 @@ class ProxmarkApp(tk.Tk):
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "Proxmark3 GUI Commander v26\nIcon refresh + tree auto-close."))
+        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "Proxmark3 GUI Commander vFinal\nStable batch mode."))
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Select Proxmark root folder (contains 'client' subfolder)")
@@ -573,7 +716,7 @@ class ProxmarkApp(tk.Tk):
                 messagebox.showwarning("Warning", "В выбранной папке нет подпапки 'client'.")
                 return
             self.pm3_folder.set(folder)
-            self.log_message(f"[INFO] Selected folder: {folder}\n")
+            self.status_message(f"[INFO] Selected folder: {folder}")
             self.save_current_config()
             self.init_prox()
             self.build_tree()
@@ -583,38 +726,44 @@ class ProxmarkApp(tk.Tk):
             "pm3_folder": self.pm3_folder.get(),
             "com_port": self.com_port.get(),
             "encoding": self.encoding_var.get(),
-            "last_path": self.last_path
+            "last_path": self.last_path,
+            "last_full_command": self.last_full_command,
+            "append_exit": self.append_exit_var.get()
         }
         save_config(config)
 
     def on_encoding_changed(self):
-        self.log_message(f"[INFO] Encoding changed to {self.encoding_var.get()}. Reinit.\n")
+        self.status_message(f"[INFO] Encoding changed to {self.encoding_var.get()}. Reinit.")
         self.save_current_config()
         self.init_prox()
         self.build_tree()
 
     def init_prox(self):
         if self.pm3_folder.get() and os.path.isdir(os.path.join(self.pm3_folder.get(), "client")):
-            self.log_message(f"[INFO] Connecting to {self.com_port.get()}...\n")
-            self.prox = ProxmarkBatch(self.pm3_folder.get(), self.com_port.get(), self.encoding_var.get())
+            self.status_message(f"[INFO] Connecting to {self.com_port.get()}...")
+            self.batch = ProxmarkBatch(self.pm3_folder.get(), self.com_port.get(), self.encoding_var.get())
             self.wiegand_loaded.clear()
             threading.Thread(target=self._init_sequence, daemon=True).start()
             self.status_var.set("Connected")
         else:
-            self.prox = None
+            self.batch = None
             self.status_var.set("Folder not set")
 
     def _init_sequence(self):
-        self.load_wiegand_formats()
-        self.show_hw_version()
+        output = self.batch.run_command_batch("wiegand list", timeout=15)
+        self._parse_wiegand(output)
+        output = self.batch.run_command_batch("hw version", timeout=15)
+        clean = self.clean_text(output)
+        lines = clean.splitlines()
+        if lines and 'pm3 -->' in lines[-1]:
+            lines.pop()
+        if lines and 'pm3 -->' in lines[-1]:
+            lines.pop()
+        self.log_message('\n'.join(lines) + '\n')
 
-    def load_wiegand_formats(self):
-        if not self.prox:
-            return
-        self.log_message("[INFO] Loading Wiegand format list...\n")
-        output = self.prox.run_command("wiegand list", timeout=15)
-        lines = output.splitlines()
+    def _parse_wiegand(self, output):
         formats = []
+        lines = output.splitlines()
         start = -1
         for i, line in enumerate(lines):
             stripped = line.strip()
@@ -634,14 +783,7 @@ class ProxmarkApp(tk.Tk):
                     formats.append((name, desc))
         self.wiegand_formats = formats
         self.wiegand_loaded.set()
-        self.log_message(f"[INFO] Loaded {len(formats)} Wiegand formats.\n")
-
-    def show_hw_version(self):
-        if not self.prox:
-            return
-        self.log_message("[INFO] Getting hardware version...\n")
-        output = self.prox.run_command("hw version", timeout=15)
-        self.log_message(self.clean_text(output) + "\n")
+        self.status_message(f"[INFO] Loaded {len(formats)} Wiegand formats.")
 
     def clean_text(self, text):
         ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
@@ -652,7 +794,7 @@ class ProxmarkApp(tk.Tk):
     def build_tree(self):
         if self.tree_building:
             return
-        if not self.prox:
+        if not self.batch:
             messagebox.showerror("Error", "Сначала выберите папку Proxmark.")
             return
         self.tree_building = True
@@ -669,11 +811,10 @@ class ProxmarkApp(tk.Tk):
         self.tree_building = False
         self.status_var.set("Ready")
         save_tree_cache(self.pm3_folder.get(), tree_data)
-        # Восстанавливаем последний путь после построения
-        self.after(100, self.restore_last_path)
+        self.after(100, self.restore_last_state)
 
     def _build_node(self, base_path, parent_list):
-        output = self.prox.get_help(base_path)
+        output = self.batch.get_help(base_path)
         if not output:
             return
         output_clean = self.clean_text(output)
@@ -708,20 +849,31 @@ class ProxmarkApp(tk.Tk):
                     add_nodes(node["children"], iid)
         add_nodes(tree_data)
 
-    def restore_last_path(self):
-        """Раскрывает последний выбранный узел и заполняет Manual command."""
-        if not self.last_path:
-            return
-        if self.last_path in self.path_to_iid:
-            iid = self.path_to_iid[self.last_path]
-            self.tree.see(iid)
-            self.tree.selection_set(iid)
-            # Закроем все другие ветви, открываем только нужную
-            self._close_all_except_path(self.last_path)
-            # Заполним Manual command
+    def restore_last_state(self):
+        cmd = self.last_full_command.strip() if self.last_full_command else ""
+        if cmd:
             self.cmd_entry.delete(0, tk.END)
-            self.cmd_entry.insert(0, self.last_path)
-            self.last_path = ""  # сбросим, чтобы не повторять
+            self.cmd_entry.insert(0, cmd)
+            parts = cmd.split()
+            base_path_parts = []
+            for part in parts[1:]:
+                if part.startswith('-'):
+                    break
+                base_path_parts.append(part)
+            base_path = ' '.join(parts[0:1] + base_path_parts) if base_path_parts else parts[0]
+            if base_path in self.path_to_iid:
+                iid = self.path_to_iid[base_path]
+                self.tree.see(iid)
+                self.tree.selection_set(iid)
+                self._close_all_except_path(base_path)
+        else:
+            if self.last_path and self.last_path in self.path_to_iid:
+                iid = self.path_to_iid[self.last_path]
+                self.tree.see(iid)
+                self.tree.selection_set(iid)
+                self._close_all_except_path(self.last_path)
+                self.cmd_entry.delete(0, tk.END)
+                self.cmd_entry.insert(0, self.last_path)
 
     def parse_help_output(self, text):
         commands = []
@@ -756,11 +908,9 @@ class ProxmarkApp(tk.Tk):
         return commands
 
     def on_tree_open(self, event):
-        """При открытии узла закрываем все остальные."""
         item = self.tree.focus()
         if not item:
             return
-        # Получаем путь от корня
         path_parts = []
         current = item
         while current:
@@ -770,12 +920,9 @@ class ProxmarkApp(tk.Tk):
         self._close_all_except_path(full_path)
 
     def _close_all_except_path(self, path):
-        """Закрывает все узлы, кроме тех, что входят в путь path."""
-        # Откроем все родительские узлы пути
         if not path:
             return
         parts = path.split()
-        # Закроем всех детей корня, кроме первого элемента пути
         root_children = self.tree.get_children('')
         first_part = parts[0] if parts else ""
         for child in root_children:
@@ -783,16 +930,18 @@ class ProxmarkApp(tk.Tk):
                 self.tree.item(child, open=False)
             else:
                 self.tree.item(child, open=True)
-        # Теперь пройдём по родительской цепочке
         parent = self.path_to_iid.get(first_part, '')
         for part in parts[1:]:
             children = self.tree.get_children(parent)
+            found = False
             for child in children:
                 if self.tree.item(child, "text").split(" (")[0] == part:
                     self.tree.item(child, open=True)
                     parent = child
+                    found = True
                     break
-            # Закроем всех других детей
+            if not found:
+                break
             for child in children:
                 if self.tree.item(child, "text").split(" (")[0] != part:
                     self.tree.item(child, open=False)
@@ -806,61 +955,28 @@ class ProxmarkApp(tk.Tk):
         if selection:
             full_path = selection[0]
             if not self.tree.get_children(selection[0]):
-                self.cmd_entry.delete(0, tk.END)
-                self.cmd_entry.insert(0, full_path)
+                self.update_manual(full_path)
                 self.last_path = full_path
                 self.save_current_config()
 
-    def on_tree_double_click(self, event):
-        selection = self.tree.selection()
-        if not selection:
-            return
-        full_path = selection[0]
-        if self.tree.get_children(selection[0]):
-            return
-        if not self.prox:
-            return
-        if not self.wiegand_loaded.is_set():
-            self.log_message("[WARN] Wiegand formats still loading, please wait...\n")
-            return
-        saved = self.options_cache.get(full_path, {})
-        CommandDialog(self, self.prox, full_path, self.wiegand_formats, self.set_manual_command, saved)
-
-    def execute_selected_command(self):
-        selection = self.tree.selection()
-        if not selection:
-            return
-        full_path = selection[0]
-        if self.tree.get_children(selection[0]):
-            return
-        if not self.prox:
-            return
-        if not self.wiegand_loaded.is_set():
-            self.log_message("[WARN] Wiegand formats still loading, please wait...\n")
-            return
-        saved = self.options_cache.get(full_path, {})
-        CommandDialog(self, self.prox, full_path, self.wiegand_formats, self.set_manual_command, saved)
-
-    def set_manual_command(self, cmd):
-        self.cmd_entry.delete(0, tk.END)
-        self.cmd_entry.insert(0, cmd)
-
-    def send_manual_command(self, event=None):
-        cmd = self.cmd_entry.get().strip()
-        if cmd:
-            self.run_manual_command(cmd)
-            self.cmd_entry.delete(0, tk.END)
-
     def run_manual_command(self, cmd):
-        if not self.prox:
-            self.log_message("[ERROR] Proxmark not initialized.\n")
+        if not self.batch:
+            self.status_message("[ERROR] Proxmark not initialized.")
             return
         self.status_var.set(f"Running: {cmd}")
-        self.log_message(f"[EXEC] {cmd}\n")
+        self.status_message(f"[EXEC] {cmd}")
+        self.command_running = True
         def worker():
-            output = self.prox.run_command(cmd, timeout=60)
-            self.log_message(output + "\n")
-            self.status_var.set("Ready")
+            output = self.batch.run_command_batch(cmd, timeout=120)
+            clean = self.clean_text(output)
+            lines = clean.splitlines()
+            if lines and 'pm3 -->' in lines[-1]:
+                lines.pop()
+            if lines and 'pm3 -->' in lines[-1]:
+                lines.pop()
+            self.after(0, self.log_message, '\n'.join(lines) + '\n')
+            self.command_running = False
+            self.after(0, lambda: self.status_var.set("Ready"))
         threading.Thread(target=worker, daemon=True).start()
 
     def show_context_menu(self, event):
@@ -874,7 +990,14 @@ class ProxmarkApp(tk.Tk):
             self.log_text.insert(tk.END, text)
             self.log_text.see(tk.END)
 
+    def status_message(self, text):
+        if hasattr(self, 'status_text') and self.status_text.winfo_exists():
+            self.status_text.insert('1.0', text + '\n')
+            self.status_text.see('1.0')
+
     def on_closing(self):
+        self.last_full_command = self.cmd_entry.get().strip()
+        self.save_current_config()
         self.destroy()
 
 if __name__ == '__main__':
