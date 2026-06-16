@@ -1,119 +1,120 @@
 Proxmark3 GUI Commander
-Удобный графический интерфейс для Proxmark3 на Windows.
-Забудьте о командной строке — все команды, опции, примеры и форматы теперь в одном окне.
+A modern graphical interface for Proxmark3 on Windows.
+Forget the command line — all commands, options, examples, and formats are now in one window.
 
 https://img.shields.io/badge/python-3.8+-blue https://img.shields.io/badge/platform-Windows-lightgrey
 
-📸 Скриншоты
-Дерево команд и панель опций	Диалог выбора формата Wiegand
+📸 Screenshots
+Command Tree & Options Panel	Wiegand Format Chooser
 https://screenshots/main.png	https://screenshots/format.png
-(скриншоты будут добавлены после первого запуска)
+(screenshots will be added after first launch)
 
-🚀 Возможности
-Автоматическое построение дерева команд — программа сканирует ваш Proxmark3, получает справку для каждого раздела и строит иерархическое дерево всех доступных команд.
+🚀 Features
+Automatic command tree – scans your Proxmark3, retrieves help for every section, and builds a hierarchical tree of all available commands.
 
-Панель опций с автозаполнением — для каждой конечной команды отображаются флажки, текстовые поля и выпадающие списки, загружаемые из секции options:.
+Options panel with auto‑fill – for each leaf command, checkboxes, text fields, and dropdowns are generated from the options: section.
 
-Выбор форматов Wiegand — загружается полный список из wiegand list с удобным выпадающим списком (название + описание).
+Wiegand format picker – loads the complete list from wiegand list with a handy dropdown (name + description).
 
-Примеры использования — двойной клик по примеру мгновенно заполняет все опции.
+Usage examples – double‑click an example to instantly fill all options.
 
-Сохранение последних опций — для каждой команды запоминаются последние использованные значения и автоматически подставляются при следующем открытии.
+Persistent options – last‑used values are saved per command and automatically restored on next opening.
 
-Real‑time вывод в лог — весь вывод Proxmark3 отображается в чёрной консоли Session Log по мере поступления.
+Real‑time log output – all Proxmark3 output appears line‑by‑line in the black Session Log.
 
-Служебная панель — системные сообщения (Exec, ошибки, Usage) выводятся в отдельную жёлтую область и не засоряют лог.
+Separate status panel – system messages (Exec, errors, Usage) are shown in a yellow area and don’t clutter the log.
 
-Кнопка «cmd» — открывает обычную командную строку с запущенным pm3.bat и автоматически печатает команду из поля Manual command (без выполнения).
+"cmd" button – opens a regular command prompt with pm3.bat running and automatically types the manual command (without executing it).
 
-Кэширование дерева — после первого построения дерево сохраняется в JSON и загружается мгновенно при следующих запусках.
+Tree caching – after the first scan the tree is saved as JSON and loads instantly on subsequent launches.
 
-Сохранение всех настроек — папка Proxmark, COM‑порт, кодировка и последняя команда восстанавливаются автоматически.
+All settings preserved – Proxmark folder, COM port, encoding, and last command are restored automatically.
 
-Пакетный режим выполнения — каждая команда запускается отдельным процессом proxmark3.exe -c "команда; exit", что исключает зависания и конфликты порта.
+Batch execution mode – every command runs as a separate proxmark3.exe -c "command; exit" process, avoiding port hangs and conflicts.
 
-Настраиваемая кодировка — выберите UTF‑8, CP1251, CP866 и другие для корректного отображения кириллицы.
+Configurable encoding – choose UTF‑8, CP1251, CP866, etc., for correct Cyrillic display.
 
-📥 Установка и запуск
-1. Требования
-Windows (работа проверена на Windows 10/11).
+📥 Installation & Launch
+1. Requirements
+Windows (tested on Windows 10/11).
 
-Python 3.8 или новее (можно скачать с python.org).
+Python 3.8 or newer (download from python.org).
 
-Proxmark3 client — рабочая папка с client/proxmark3.exe, libs/ и pm3.bat.
-Вы можете взять официальную сборку по ссылке:
+Proxmark3 client – a working folder containing client/proxmark3.exe, libs/, and pm3.bat.
+You can get an official build from:
 https://www.proxmarkbuilds.org/latest/rrg_other.php
 
-2. Установка
-Склонируйте репозиторий или скачайте ZIP-архив:
+2. Installation
+Clone the repository or download the ZIP archive:
 
 bash
 git clone https://github.com/yourname/proxmark3-gui-commander.git
 cd proxmark3-gui-commander
-Все зависимости уже входят в стандартную библиотеку Python (tkinter, subprocess, threading, json, re и т.д.) — дополнительно устанавливать ничего не нужно.
+All dependencies are part of the standard Python library (tkinter, subprocess, threading, json, re, etc.) – no extra installations needed.
 
-3. Запуск
+3. Launch
 bash
 python pm3_gui.py
-При первом запуске программа предложит выбрать папку с Proxmark (Settings → Select Proxmark folder). После этого автоматически загрузятся форматы Wiegand, версия железа и построится дерево команд.
+On first launch the program will ask you to select the Proxmark folder (Settings → Select Proxmark folder). After that, Wiegand formats, hardware version, and the command tree will load automatically.
 
-🧭 Как пользоваться
-Выбор папки Proxmark – Settings → Select Proxmark folder… укажите корневую директорию, содержащую подпапку client.
+🧭 How to Use
+Select Proxmark folder – Settings → Select Proxmark folder… and point to the root directory that contains the client subfolder.
 
-Выбор COM‑порта – в левом верхнем углу есть выпадающий список с реальными портами системы. Нажмите 🔄 для обновления.
+Choose COM port – the upper‑left combo box lists real system ports. Press 🔄 to refresh.
 
-Загрузка дерева – нажмите 🔄 справа от надписи «Command Tree» или дождитесь автоматической загрузки из кэша.
+Load the tree – press 🔄 next to “Command Tree” or wait for automatic loading from cache.
 
-Выполнение команды – дважды кликните по конечной команде в дереве. Откроется панель опций. Настройте параметры и нажмите ▶ (Send). Команда выполнится, а результат появится в Session Log.
+Execute a command – double‑click a leaf command in the tree. The options panel appears. Configure the parameters and press ▶ (Send). The command runs and the output appears in the Session Log.
 
-Ручной ввод – любую команду можно ввести в поле «Manual command» и нажать ▶ или Enter.
+Manual input – type any command in the “Manual command” field and press ▶ or Enter.
 
-Открыть консоль – кнопка cmd запускает pm3.bat в отдельном окне и автоматически печатает команду из поля Manual command (без выполнения). Останется только нажать Enter.
+Open console – the cmd button launches pm3.bat in a separate window and automatically types the manual command (without executing it). Just press Enter to run.
 
-⚙️ Настройки и кэш
-Все данные хранятся в домашней папке пользователя (C:\Users\<username>\):
+⚙️ Settings & Cache
+All data is stored in your Windows home directory (C:\Users\<username>\):
 
-Файл	Назначение
-proxmark3_gui_config.json	Путь к папке, COM‑порт, кодировка, последняя команда
-proxmark3_gui_tree_cache.json	Кэшированное дерево команд
-proxmark3_gui_options.json	Сохранённые значения опций для каждой команды
-Чтобы сбросить настройки, просто удалите эти файлы (программа создаст их заново).
+File	Purpose
+proxmark3_gui_config.json	Folder path, COM port, encoding, last command
+proxmark3_gui_tree_cache.json	Cached command tree
+proxmark3_gui_options.json	Saved option values for each command
+To reset the settings, simply delete these files (the program will recreate them).
 
-🔧 Решение проблем
-«proxmark3.exe not found»
-→ Убедитесь, что в выбранной папке есть подпапка client с proxmark3.exe.
+🔧 Troubleshooting
+"proxmark3.exe not found"
+→ Make sure the selected folder contains a client subfolder with proxmark3.exe.
 
-«ERROR: invalid serial port COM9»
-→ Порт занят другим приложением или Proxmark3 не отвечает. Закройте все консольные окна с pm3 и попробуйте снова.
+"ERROR: invalid serial port COM9"
+→ The port is busy or Proxmark3 is unresponsive. Close all other console windows with pm3 and try again.
 
-Дерево команд не заполняется / опции пустые
-→ Нажмите 🔄 возле «Command Tree» для полного перестроения. Убедитесь, что Proxmark3 подключён и определился в системе.
+Command tree is empty / options are blank
+→ Press 🔄 next to “Command Tree” to force a full rebuild. Ensure that Proxmark3 is connected and recognised by the system.
 
-Горизонтальная полоса прокрутки дерева неактивна
-→ Это нормально — она появляется только тогда, когда текст команд не помещается по ширине. При длинных описаниях узлов полоса активируется автоматически.
+Horizontal tree scrollbar is inactive
+→ This is normal – it only appears when the command text exceeds the visible width. It activates automatically for long node descriptions.
 
-Кнопка «cmd» не запускает pm3.bat
-→ Проверьте, что в папке Proxmark действительно лежит pm3.bat. Запуск идёт из выбранной корневой папки.
+"cmd" button does not start pm3.bat
+→ Verify that pm3.bat exists in the chosen Proxmark root folder. The launch uses that folder as the working directory.
 
-🏗 Структура проекта
+🏗 Project Structure
 text
 proxmark3-gui-commander/
-├── pm3_gui.py             # основной файл программы
-├── screenshots/           # скриншоты для README
+├── pm3_gui.py             # main application file
+├── screenshots/           # screenshots for README
 ├── README.md
 └── .gitignore
-🤝 Контрибьютинг
-Pull request'ы приветствуются! Если вы нашли баг или у вас есть идея по улучшению — создавайте issue.
+🤝 Contributing
+Pull requests are welcome! If you find a bug or have an idea for improvement, please open an issue.
 
-📄 Лицензия
-MIT License. Подробности в файле LICENSE.
+📄 License
+MIT License. See LICENSE for details.
 
-🙏 Благодарности
-Команде RfidResearchGroup за потрясающий Proxmark3 Iceman.
+🙏 Acknowledgments
+The RfidResearchGroup team for the awesome Proxmark3 Iceman.
 
-Разработчикам библиотеки Tkinter за простоту создания GUI на Python.
+The Tkinter developers for making Python GUI creation simple.
 
-Всем тестировщикам и контрибьюторам, кто помогал довести программу до ума.
+All testers and contributors who helped polish this tool.
 
-Proxmark3 GUI Commander — ваш персональный помощник в мире RFID.
-Попробуйте, и вы забудете о командной строке!
+Proxmark3 GUI Commander – your personal assistant in the RFID world.
+Try it and forget about the command line!
+
