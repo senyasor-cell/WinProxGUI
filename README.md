@@ -5,9 +5,8 @@ Forget the command line — all commands, options, examples, and formats are now
 https://img.shields.io/badge/python-3.8+-blue https://img.shields.io/badge/platform-Windows-lightgrey
 
 📸 Screenshots
-Command Tree & Options Panel	Wiegand Format Chooser
-https://screenshots/main.png	https://screenshots/format.png
-(screenshots will be added after first launch)
+Command Tree & Options Panel	
+![PM3 GUI](screenshots/main.png)
 
 🚀 Features
 Automatic command tree – scans your Proxmark3, retrieves help for every section, and builds a hierarchical tree of all available commands.
