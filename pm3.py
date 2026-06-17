@@ -6,6 +6,9 @@ import re
 import os
 import sys
 import json
+import queue
+import time
+from winpty import PtyProcess
 
 # ----------------------------- Configuration & Cache -----------------------------
 CONFIG_FILENAME = "proxmark3_gui_config.json"
@@ -97,7 +100,7 @@ def get_available_com_ports():
         pass
     return sorted(ports, key=lambda x: int(re.search(r'\d+', x).group()))
 
-# ----------------------------- Proxmark Batch Commander -----------------------------
+# ----------------------------- Proxmark Batch (for help) -----------------------------
 class ProxmarkBatch:
     def __init__(self, client_folder, com_port, encoding='utf-8'):
         self.client_folder = client_folder
@@ -129,7 +132,7 @@ class ProxmarkBatch:
         env['MSYSTEM'] = 'MINGW64'
         return env
 
-    def run_command_batch(self, cmd, timeout=120):
+    def run_command_batch(self, cmd, timeout=30):
         with self.lock:
             exe = self._find_proxmark_exe()
             if not exe:
@@ -182,34 +185,37 @@ class ProxmarkApp(tk.Tk):
         self.append_exit_var = tk.BooleanVar(value=config.get("append_exit", False))
 
         self.batch = None
+        self.pty_process = None
+        self.log_queue = queue.Queue()
+        self.status_queue = queue.Queue()
+        self._closing = threading.Event()
         self.path_to_iid = {}
         self.tree_building = False
         self.wiegand_formats = []
         self.wiegand_loaded = threading.Event()
-        self.tree_cache_loaded = False
         self.options_cache = load_options_cache()
-
         self.current_command_path = ""
         self.option_widgets = {}
         self.option_panel_content = None
-        self.command_running = False
 
         self.create_widgets()
         self.create_menu()
         self.after(50, self.show_manual_input)
+        self.after(100, self._process_queues)
 
         if self.pm3_folder.get():
             self.init_prox()
             cached = load_tree_cache(self.pm3_folder.get())
             if cached:
                 self.populate_tree_from_cache(cached)
-                self.tree_cache_loaded = True
                 self.status_var.set("Ready (cached tree)")
                 self.restore_last_state()
+                self._start_pty()
+                self.after(200, self.show_manual_input)
             else:
                 self.build_tree()
 
-    # ------------------------------------------------------------
+    # ---------- Виджеты ----------
     def create_widgets(self):
         main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True)
@@ -233,7 +239,6 @@ class ProxmarkApp(tk.Tk):
         self.tree_refresh_btn = ttk.Button(tree_header, text="\U0001F5D8", width=3, command=self.build_tree)
         self.tree_refresh_btn.pack(side=tk.RIGHT, padx=(0, 15))
 
-        # Контейнер для дерева – классическая сетка
         tree_container = ttk.Frame(left_frame)
         tree_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         tree_container.grid_rowconfigure(0, weight=1)
@@ -246,7 +251,6 @@ class ProxmarkApp(tk.Tk):
         v_scrollbar.grid(row=0, column=1, sticky='ns')
         h_scrollbar = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL, command=self.tree.xview)
         h_scrollbar.grid(row=1, column=0, sticky='ew')
-
         self.tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
 
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
@@ -256,7 +260,6 @@ class ProxmarkApp(tk.Tk):
         self.tree_menu.add_command(label="Execute with options", command=self.execute_selected_command)
         self.tree.bind('<Button-3>', self.show_context_menu)
 
-        # --- правая часть ---
         right_frame = ttk.Frame(main_paned)
         main_paned.add(right_frame, weight=3)
 
@@ -283,14 +286,13 @@ class ProxmarkApp(tk.Tk):
         cmd_btn = ttk.Button(cmd_frame, text="cmd", width=4, command=self.open_cmd)
         cmd_btn.pack(side=tk.LEFT, padx=(5,0))
 
-        self.right_paned = tk.PanedWindow(right_frame, orient=tk.VERTICAL, sashwidth=2, sashrelief=tk.RAISED)
+        self.right_paned = ttk.PanedWindow(right_frame, orient=tk.VERTICAL)
         self.right_paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        self.options_frame = ttk.Frame(self.right_paned)
-        self.right_paned.add(self.options_frame, height=300)
+        self.options_frame = ttk.Frame(right_frame)
 
         self.log_frame = ttk.Frame(self.right_paned)
-        self.right_paned.add(self.log_frame, height=300)
+        self.right_paned.add(self.log_frame, weight=1)
         self.log_text = scrolledtext.ScrolledText(
             self.log_frame, wrap=tk.WORD, state='normal',
             font=('Consolas', 9), bg='black', fg='lightgreen', insertbackground='white'
@@ -299,11 +301,12 @@ class ProxmarkApp(tk.Tk):
 
         self.status_var = tk.StringVar(value="Not connected")
         ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(fill=tk.X, side=tk.BOTTOM)
-    # ------------------------------------------------------------
 
-    # ---------- cmd ----------
+    # ---------- Открытие cmd с освобождением порта ----------
     def open_cmd(self):
-        """Открывает cmd в папке Proxmark, запускает pm3.bat и вставляет команду без выполнения."""
+        self.stop_pty()
+        time.sleep(0.3)  # даём время на освобождение порта
+
         folder = self.pm3_folder.get()
         if not folder or not os.path.isdir(folder):
             messagebox.showerror("Error", "Proxmark folder not set.")
@@ -323,33 +326,211 @@ class ProxmarkApp(tk.Tk):
                         f.write('WScript.Sleep 10\n')
                 subprocess.Popen(['wscript.exe', vbs_path], creationflags=subprocess.CREATE_NO_WINDOW)
             except Exception as e:
-                self.status_message(f"[WARN] VBScript error: {e}")
+                self.status_queue.put(f"[WARN] VBScript error: {e}")
         try:
-            subprocess.Popen(
-                ['cmd.exe', '/k', 'pm3.bat'],
-                cwd=folder,
-                creationflags=subprocess.CREATE_NEW_CONSOLE
-            )
-            self.status_message("[INFO] Команда отображена в консоли. Нажмите Enter для выполнения.")
+            subprocess.Popen(['cmd.exe', '/k', 'pm3.bat'], cwd=folder, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            self.status_queue.put("[INFO] Command typed in console. Press Enter to execute.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open cmd: {e}")
 
-    # ---------- Остальные методы (без изменений) ----------
+    # ---------- Очереди ----------
+    def _process_queues(self):
+        if self._closing.is_set():
+            return
+        while not self.log_queue.empty():
+            try:
+                msg = self.log_queue.get_nowait()
+                self.log_message(msg)
+            except queue.Empty:
+                break
+        while not self.status_queue.empty():
+            try:
+                msg = self.status_queue.get_nowait()
+                self.status_message(msg)
+            except queue.Empty:
+                break
+        self.after(100, self._process_queues)
+
+    # ---------- Инициализация ----------
+    def init_prox(self):
+        if self.pm3_folder.get() and os.path.isdir(os.path.join(self.pm3_folder.get(), "client")):
+            self.status_queue.put(f"[INFO] Connecting to {self.com_port.get()}...")
+            self.batch = ProxmarkBatch(self.pm3_folder.get(), self.com_port.get(), self.encoding_var.get())
+            threading.Thread(target=self._load_initial_data, daemon=True).start()
+            self.status_var.set("Connected")
+        else:
+            self.batch = None
+            self.status_var.set("Folder not set")
+
+    def _load_initial_data(self):
+        output = self.batch.run_command_batch("wiegand list", timeout=15)
+        self._parse_wiegand(output)
+
+    def _start_pty(self):
+        """Запускает PTY, возвращает True при успехе."""
+        if self.pty_process and self.pty_process.isalive():
+            return True
+        exe = os.path.join(self.pm3_folder.get(), "client", "proxmark3.exe")
+        if not os.path.isfile(exe):
+            exe = os.path.join(self.pm3_folder.get(), "client", "build", "proxmark3.exe")
+        if not os.path.isfile(exe):
+            self.status_queue.put("[ERROR] proxmark3.exe not found")
+            return False
+        env = self.batch._build_environment()
+        try:
+            self.pty_process = PtyProcess.spawn(
+                [exe, '-p', self.com_port.get(), '-w'],
+                cwd=os.path.join(self.pm3_folder.get(), "client"),
+                env=env,
+                dimensions=(40, 120)
+            )
+            self.status_queue.put("[INFO] Pseudo‑terminal started.")
+            threading.Thread(target=self._pty_reader, daemon=True).start()
+            return True
+        except Exception as e:
+            self.status_queue.put(f"[ERROR] Failed to start pty: {e}")
+            self.pty_process = None
+            return False
+
+    def _parse_wiegand(self, output):
+        formats = []
+        lines = output.splitlines()
+        start = -1
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('[=]') and '----' in stripped:
+                start = i + 1
+                break
+        if start > 0:
+            for line in lines[start:]:
+                stripped = line.strip()
+                if not stripped.startswith('[=]'):
+                    continue
+                token = stripped[3:].strip()
+                if token:
+                    parts = token.split(None, 1)
+                    name = parts[0]
+                    desc = parts[1] if len(parts) > 1 else ""
+                    formats.append((name, desc))
+        self.wiegand_formats = formats
+        self.wiegand_loaded.set()
+        self.status_queue.put(f"[INFO] Loaded {len(formats)} Wiegand formats.")
+
+    def _pty_reader(self):
+        try:
+            while not self._closing.is_set() and self.pty_process and self.pty_process.isalive():
+                data = self.pty_process.read(1024)
+                if data:
+                    for line in data.splitlines(keepends=True):
+                        clean = re.sub(r'\x1b\[[0-9;]*m', '', line)
+                        self.log_queue.put(clean)
+        except EOFError:
+            pass
+        except Exception as e:
+            self.log_queue.put(f"[ERROR] PTY reader: {e}\n")
+        finally:
+            self.pty_process = None
+            self.status_queue.put("[INFO] Pseudo‑terminal closed.")
+
+    def _pty_write(self, text):
+        if self.pty_process and self.pty_process.isalive():
+            try:
+                self.pty_process.write(text)
+            except Exception as e:
+                self.status_queue.put(f"[ERROR] PTY write: {e}")
+
+    def run_manual_command(self, cmd):
+        # Если PTY не активен, пытаемся перезапустить
+        if not self.pty_process or not self.pty_process.isalive():
+            self.status_queue.put("[INFO] PTY not running, attempting to restart...")
+            if not self._start_pty():
+                self.status_queue.put("[ERROR] Failed to restart PTY. Check COM port.")
+                return
+            # Небольшая задержка для инициализации
+            time.sleep(0.5)
+            if not self.pty_process or not self.pty_process.isalive():
+                self.status_queue.put("[ERROR] PTY still not running.")
+                return
+        self.status_var.set(f"Running: {cmd}")
+        self.status_queue.put(f"[EXEC] {cmd}")
+        self._pty_write(cmd + "\n")
+
+    def stop_pty(self):
+        if self.pty_process:
+            try:
+                self.pty_process.write("exit\n")
+                self.pty_process.close()
+            except:
+                pass
+            self.pty_process = None
+
+    # ---------- Построение дерева ----------
+    def build_tree(self):
+        if self.tree_building:
+            return
+        if not self.batch:
+            messagebox.showerror("Error", "Сначала выберите папку Proxmark.")
+            return
+        pty_was_active = False
+        if self.pty_process and self.pty_process.isalive():
+            self.stop_pty()
+            self.status_queue.put("[INFO] PTY stopped temporarily for tree rebuild.")
+            pty_was_active = True
+        self.tree_building = True
+        self.status_var.set("Building tree...")
+        self.tree.delete(*self.tree.get_children())
+        self.path_to_iid.clear()
+        folder = self.pm3_folder.get()
+        threading.Thread(target=self._tree_builder_thread, args=(folder, pty_was_active), daemon=True).start()
+        self.show_manual_input()
+
+    def _tree_builder_thread(self, folder, pty_was_active):
+        self.wiegand_loaded.wait(timeout=10)
+        tree_data = []
+        self._build_node('', tree_data)
+        self.tree_building = False
+        self.after(0, lambda: self.status_var.set("Ready"))
+        save_tree_cache(folder, tree_data)
+        self.after(100, self.restore_last_state)
+        if pty_was_active:
+            self.after(500, self._start_pty)
+        else:
+            self.after(500, self._start_pty)
+        self.after(600, self.show_manual_input)
+
+    def _build_node(self, base_path, parent_list):
+        output = self.batch.get_help(base_path)
+        if not output:
+            return
+        output_clean = self.clean_text(output)
+        self.log_queue.put(f"[CMD] {base_path} -h\n")
+        self.log_queue.put(output_clean + "\n")
+        commands = self.parse_help_output(output_clean)
+        for name, desc, is_folder in commands:
+            full_path = f"{base_path} {name}".strip()
+            node = {"name": name, "path": full_path, "desc": desc, "children": []}
+            self.after(0, self._add_tree_node, base_path, name, full_path, desc)
+            if is_folder:
+                self._build_node(full_path, node["children"])
+            parent_list.append(node)
+
+    # ---------- Управление панелью опций ----------
     def show_manual_input(self):
         for widget in self.options_frame.winfo_children():
             widget.destroy()
         self.option_widgets = {}
         self.current_command_path = ""
         self.option_panel_content = None
-        if hasattr(self, 'right_paned'):
-            self.right_paned.paneconfigure(self.options_frame, height=0, minsize=0)
-            self.right_paned.paneconfigure(self.log_frame, minsize=100)
+        try:
+            self.right_paned.forget(self.options_frame)
+        except tk.TclError:
+            pass
 
     def load_command_options(self, command_path):
         if not self.batch:
             return
         if not self.wiegand_loaded.is_set():
-            self.status_message("[WARN] Wiegand formats still loading...")
+            self.status_queue.put("[WARN] Wiegand formats still loading...")
             return
         self.current_command_path = command_path
         saved = self.options_cache.get(command_path, {})
@@ -357,7 +538,17 @@ class ProxmarkApp(tk.Tk):
             widget.destroy()
         self.option_widgets = {}
 
-        self.right_paned.paneconfigure(self.options_frame, height=400, minsize=200)
+        pty_was_active = False
+        if self.pty_process and self.pty_process.isalive():
+            self.stop_pty()
+            self.status_queue.put("[INFO] PTY stopped temporarily for help query.")
+            pty_was_active = True
+
+        self.right_paned.insert(0, self.options_frame)
+        self.right_paned.pane(self.options_frame, weight=0)
+        self.right_paned.pane(self.log_frame, weight=1)
+        self.update_idletasks()
+        self.right_paned.sashpos(0, 300)
 
         self.option_panel_content = ttk.Frame(self.options_frame)
         self.option_panel_content.pack(fill=tk.BOTH, expand=True)
@@ -388,17 +579,19 @@ class ProxmarkApp(tk.Tk):
         self.status_label.pack(pady=5)
 
         self.update_manual(command_path)
-        threading.Thread(target=self._load_options_thread, args=(command_path, saved), daemon=True).start()
+        threading.Thread(target=self._load_options_thread, args=(command_path, saved, pty_was_active), daemon=True).start()
 
-    def _load_options_thread(self, command_path, saved_options):
+    def _load_options_thread(self, command_path, saved_options, pty_was_active):
         try:
             output = self.batch.get_help(command_path)
         except Exception as e:
             self.after(0, self._show_error, f"Failed to get help: {e}")
+            if pty_was_active:
+                self.after(500, self._start_pty)
             return
-        self.after(0, self._process_options_help, output, saved_options)
+        self.after(0, self._process_options_help, output, saved_options, pty_was_active)
 
-    def _process_options_help(self, output, saved_options):
+    def _process_options_help(self, output, saved_options, pty_was_active):
         output = self.clean_text(output)
         lines = output.splitlines()
         opts_start = -1
@@ -424,7 +617,7 @@ class ProxmarkApp(tk.Tk):
                 if line:
                     usage_lines.append(f"[USAGE] {line}")
             usage_str = '\n'.join(usage_lines)
-            self.status_message(usage_str)
+            self.status_queue.put(usage_str)
 
         for i, line in enumerate(lines):
             if re.search(r'examples', line, re.IGNORECASE):
@@ -453,6 +646,8 @@ class ProxmarkApp(tk.Tk):
 
         if opts_start == -1:
             self._show_error("Options section not found.")
+            if pty_was_active:
+                self.after(500, self._start_pty)
             return
 
         option_lines = []
@@ -499,7 +694,10 @@ class ProxmarkApp(tk.Tk):
                         var.set(str(saved_val))
         self.update_manual(self.build_command())
         self.status_label.config(text="Ready")
+        if pty_was_active:
+            self.after(500, self._start_pty)
 
+    # ---------- Остальные методы ----------
     def _create_option_widget(self, parent, flag, alias, opt_type, desc):
         frame = ttk.Frame(parent)
         frame.pack(fill='x', padx=5, pady=2)
@@ -634,6 +832,16 @@ class ProxmarkApp(tk.Tk):
             self.cmd_entry.delete(0, tk.END)
             self.cmd_entry.insert(0, cmd)
 
+    def on_tree_select(self, event):
+        self.show_manual_input()
+        selection = self.tree.selection()
+        if selection:
+            full_path = selection[0]
+            if not self.tree.get_children(selection[0]):
+                self.update_manual(full_path)
+                self.last_path = full_path
+                self.save_current_config()
+
     def on_tree_double_click(self, event):
         selection = self.tree.selection()
         if not selection:
@@ -644,7 +852,7 @@ class ProxmarkApp(tk.Tk):
         if not self.batch:
             return
         if not self.wiegand_loaded.is_set():
-            self.status_message("[WARN] Wiegand formats still loading...")
+            self.status_queue.put("[WARN] Wiegand formats still loading...")
             return
         self.load_command_options(full_path)
 
@@ -658,7 +866,7 @@ class ProxmarkApp(tk.Tk):
         if not self.batch:
             return
         if not self.wiegand_loaded.is_set():
-            self.status_message("[WARN] Wiegand formats still loading...")
+            self.status_queue.put("[WARN] Wiegand formats still loading...")
             return
         self.load_command_options(full_path)
 
@@ -670,18 +878,17 @@ class ProxmarkApp(tk.Tk):
 
     def refresh_com_ports(self):
         self._update_combo_ports()
-        self.status_message("[INFO] COM port list refreshed.")
+        self.status_queue.put("[INFO] COM port list refreshed.")
 
     def on_com_port_changed(self, event=None):
         new_port = self.com_port.get()
-        self.status_message(f"[INFO] COM port changed to {new_port}. Reconnecting...")
+        self.status_queue.put(f"[INFO] COM port changed to {new_port}. Reconnecting...")
         self.save_current_config()
         self.init_prox()
 
     def on_append_exit_changed(self):
-        self.status_message(f"[INFO] Append exit after command: {self.append_exit_var.get()}")
-        self.save_current_config()
-        self.init_prox()
+        # Оставлен для совместимости, но не используется
+        pass
 
     def create_menu(self):
         menubar = tk.Menu(self)
@@ -693,7 +900,7 @@ class ProxmarkApp(tk.Tk):
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="Select Proxmark folder...", command=self.select_folder)
-        settings_menu.add_checkbutton(label="Append 'exit' after command", variable=self.append_exit_var, command=self.on_append_exit_changed)
+        # Пункт "Append exit" удалён
         enc_menu = tk.Menu(settings_menu, tearoff=0)
         encodings = [
             ("UTF-8", "utf-8"), ("CP1251 (Windows Cyrillic)", "cp1251"),
@@ -707,7 +914,7 @@ class ProxmarkApp(tk.Tk):
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "Proxmark3 GUI Commander vFinal\nStable batch mode."))
+        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "Proxmark3 GUI Commander vFinal\nFixed layout."))
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Select Proxmark root folder (contains 'client' subfolder)")
@@ -716,7 +923,7 @@ class ProxmarkApp(tk.Tk):
                 messagebox.showwarning("Warning", "В выбранной папке нет подпапки 'client'.")
                 return
             self.pm3_folder.set(folder)
-            self.status_message(f"[INFO] Selected folder: {folder}")
+            self.status_queue.put(f"[INFO] Selected folder: {folder}")
             self.save_current_config()
             self.init_prox()
             self.build_tree()
@@ -733,101 +940,16 @@ class ProxmarkApp(tk.Tk):
         save_config(config)
 
     def on_encoding_changed(self):
-        self.status_message(f"[INFO] Encoding changed to {self.encoding_var.get()}. Reinit.")
+        self.status_queue.put(f"[INFO] Encoding changed to {self.encoding_var.get()}. Reinit.")
         self.save_current_config()
         self.init_prox()
         self.build_tree()
-
-    def init_prox(self):
-        if self.pm3_folder.get() and os.path.isdir(os.path.join(self.pm3_folder.get(), "client")):
-            self.status_message(f"[INFO] Connecting to {self.com_port.get()}...")
-            self.batch = ProxmarkBatch(self.pm3_folder.get(), self.com_port.get(), self.encoding_var.get())
-            self.wiegand_loaded.clear()
-            threading.Thread(target=self._init_sequence, daemon=True).start()
-            self.status_var.set("Connected")
-        else:
-            self.batch = None
-            self.status_var.set("Folder not set")
-
-    def _init_sequence(self):
-        output = self.batch.run_command_batch("wiegand list", timeout=15)
-        self._parse_wiegand(output)
-        output = self.batch.run_command_batch("hw version", timeout=15)
-        clean = self.clean_text(output)
-        lines = clean.splitlines()
-        if lines and 'pm3 -->' in lines[-1]:
-            lines.pop()
-        if lines and 'pm3 -->' in lines[-1]:
-            lines.pop()
-        self.log_message('\n'.join(lines) + '\n')
-
-    def _parse_wiegand(self, output):
-        formats = []
-        lines = output.splitlines()
-        start = -1
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith('[=]') and '----' in stripped:
-                start = i + 1
-                break
-        if start > 0:
-            for line in lines[start:]:
-                stripped = line.strip()
-                if not stripped.startswith('[=]'):
-                    continue
-                token = stripped[3:].strip()
-                if token:
-                    parts = token.split(None, 1)
-                    name = parts[0]
-                    desc = parts[1] if len(parts) > 1 else ""
-                    formats.append((name, desc))
-        self.wiegand_formats = formats
-        self.wiegand_loaded.set()
-        self.status_message(f"[INFO] Loaded {len(formats)} Wiegand formats.")
 
     def clean_text(self, text):
         ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
         text = ansi_escape.sub('', text)
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
         return text
-
-    def build_tree(self):
-        if self.tree_building:
-            return
-        if not self.batch:
-            messagebox.showerror("Error", "Сначала выберите папку Proxmark.")
-            return
-        self.tree_building = True
-        self.status_var.set("Building tree...")
-        self.tree.delete(*self.tree.get_children())
-        self.path_to_iid.clear()
-        self.tree_cache_loaded = False
-        threading.Thread(target=self._tree_builder_thread, daemon=True).start()
-
-    def _tree_builder_thread(self):
-        self.wiegand_loaded.wait(timeout=10)
-        tree_data = []
-        self._build_node('', tree_data)
-        self.tree_building = False
-        self.status_var.set("Ready")
-        save_tree_cache(self.pm3_folder.get(), tree_data)
-        self.after(100, self.restore_last_state)
-
-    def _build_node(self, base_path, parent_list):
-        output = self.batch.get_help(base_path)
-        if not output:
-            return
-        output_clean = self.clean_text(output)
-        self.log_message(f"[CMD] {base_path} -h\n")
-        self.log_message(output_clean + "\n")
-        commands = self.parse_help_output(output_clean)
-        for name, desc, is_folder in commands:
-            full_path = f"{base_path} {name}".strip()
-            node = {"name": name, "path": full_path, "desc": desc, "children": []}
-            self.after(0, self._add_tree_node, base_path, name, full_path, desc)
-            if is_folder:
-                self._build_node(full_path, node["children"])
-            parent_list.append(node)
 
     def _add_tree_node(self, parent_path, name, full_path, desc):
         parent_iid = '' if parent_path == '' else self.path_to_iid.get(parent_path, '')
@@ -950,35 +1072,6 @@ class ProxmarkApp(tk.Tk):
         self.options_cache[command_path] = options
         save_options_cache(self.options_cache)
 
-    def on_tree_select(self, event):
-        selection = self.tree.selection()
-        if selection:
-            full_path = selection[0]
-            if not self.tree.get_children(selection[0]):
-                self.update_manual(full_path)
-                self.last_path = full_path
-                self.save_current_config()
-
-    def run_manual_command(self, cmd):
-        if not self.batch:
-            self.status_message("[ERROR] Proxmark not initialized.")
-            return
-        self.status_var.set(f"Running: {cmd}")
-        self.status_message(f"[EXEC] {cmd}")
-        self.command_running = True
-        def worker():
-            output = self.batch.run_command_batch(cmd, timeout=120)
-            clean = self.clean_text(output)
-            lines = clean.splitlines()
-            if lines and 'pm3 -->' in lines[-1]:
-                lines.pop()
-            if lines and 'pm3 -->' in lines[-1]:
-                lines.pop()
-            self.after(0, self.log_message, '\n'.join(lines) + '\n')
-            self.command_running = False
-            self.after(0, lambda: self.status_var.set("Ready"))
-        threading.Thread(target=worker, daemon=True).start()
-
     def show_context_menu(self, event):
         item = self.tree.identify_row(event.y)
         if item:
@@ -996,6 +1089,8 @@ class ProxmarkApp(tk.Tk):
             self.status_text.see('1.0')
 
     def on_closing(self):
+        self.stop_pty()
+        self._closing.set()
         self.last_full_command = self.cmd_entry.get().strip()
         self.save_current_config()
         self.destroy()
