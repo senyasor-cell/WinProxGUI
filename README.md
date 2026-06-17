@@ -1,54 +1,56 @@
-Proxmark3 GUI Commander
-A modern graphical interface for Proxmark3 on Windows.
+markdown
+# Proxmark3 GUI Commander
+
+A modern graphical interface for Proxmark3 on Windows.  
 Forget the command line — all commands, options, examples, and formats are now in one window.
 
-https://img.shields.io/badge/python-3.8+-blue https://img.shields.io/badge/platform-Windows-lightgrey
+![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)
+![Platform Windows](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 
-📸 Screenshots
-Command Tree & Options Panel	
+---
+
+## 📸 Screenshots
+
+**Command Tree & Options Panel**  
 ![PM3 GUI](screenshots/main.png)
 
-🚀 Features
-Automatic command tree – scans your Proxmark3, retrieves help for every section, and builds a hierarchical tree of all available commands.
+---
 
-Options panel with auto‑fill – for each leaf command, checkboxes, text fields, and dropdowns are generated from the options: section.
+## 🚀 Features
 
-Wiegand format picker – loads the complete list from wiegand list with a handy dropdown (name + description).
+- **Automatic command tree** – scans your Proxmark3, retrieves help for every section, and builds a hierarchical tree of all available commands.
+- **Options panel with auto‑fill** – for each leaf command, checkboxes, text fields, and dropdowns are generated from the `Options:` section.
+- **Wiegand format picker** – loads the complete list from `wiegand list` with a handy dropdown (name + description).
+- **Usage examples** – double‑click an example to instantly fill all options.
+- **Persistent options** – last‑used values are saved per command and automatically restored on next opening.
+- **Real‑time log output** – all Proxmark3 output appears line‑by‑line in the black Session Log.
+- **Separate status panel** – system messages (`[EXEC]`, errors, `[USAGE]`) are shown in a yellow area and don’t clutter the log.
+- **"cmd" button** – opens a regular command prompt with `pm3.bat` running and automatically types the manual command (without executing it). The COM port is released before launch and automatically re‑acquired when you send commands from the GUI afterwards.
+- **Automatic PTY restart** – if the pseudo‑terminal is stopped (e.g., after closing an external console), it restarts on the next command submission.
+- **Tree caching** – after the first scan the tree is saved as JSON and loads instantly on subsequent launches.
+- **All settings preserved** – Proxmark folder, COM port, encoding, and last command are restored automatically.
+- **Batch execution mode** – every command runs as a separate `proxmark3.exe -c "command; exit"` process, avoiding port hangs and conflicts.
+- **Configurable encoding** – choose UTF‑8, CP1251, CP866, etc., for correct Cyrillic display.
 
-Usage examples – double‑click an example to instantly fill all options.
+---
 
-Persistent options – last‑used values are saved per command and automatically restored on next opening.
+## 📥 Installation & Launch
 
-Real‑time log output – all Proxmark3 output appears line‑by‑line in the black Session Log.
+### 1. Requirements
 
-Separate status panel – system messages (Exec, errors, Usage) are shown in a yellow area and don’t clutter the log.
+- **Windows** (tested on Windows 10/11).
+- **Python 3.8 or newer** – download from [python.org](https://www.python.org/).
+- **Proxmark3 client** – a working folder containing `client/proxmark3.exe`, `libs/`, and `pm3.bat`.  
+  You can get an official build from:  
+  [https://www.proxmarkbuilds.org/latest/rrg_other.php](https://www.proxmarkbuilds.org/latest/rrg_other.php)
 
-"cmd" button – opens a regular command prompt with pm3.bat running and automatically types the manual command (without executing it).
+### 2. Installation
 
-Tree caching – after the first scan the tree is saved as JSON and loads instantly on subsequent launches.
-
-All settings preserved – Proxmark folder, COM port, encoding, and last command are restored automatically.
-
-Batch execution mode – every command runs as a separate proxmark3.exe -c "command; exit" process, avoiding port hangs and conflicts.
-
-Configurable encoding – choose UTF‑8, CP1251, CP866, etc., for correct Cyrillic display.
-
-📥 Installation & Launch
-1. Requirements
-Windows (tested on Windows 10/11).
-
-Python 3.8 or newer (download from python.org).
-
-Proxmark3 client – a working folder containing client/proxmark3.exe, libs/, and pm3.bat.
-You can get an official build from:
-https://www.proxmarkbuilds.org/latest/rrg_other.php
-
-2. Installation
 Clone the repository or download the ZIP archive:
 
-bash
+```bash
 git clone https://github.com/senyasor-cell/WinProxGUI
-cd proxmark3-gui-commander
+cd WinProxGUI
 All dependencies are part of the standard Python library (tkinter, subprocess, threading, json, re, etc.) – no extra installations needed.
 
 3. Launch
@@ -57,7 +59,7 @@ python pm3_gui.py
 On first launch the program will ask you to select the Proxmark folder (Settings → Select Proxmark folder). After that, Wiegand formats, hardware version, and the command tree will load automatically.
 
 🧭 How to Use
-Select Proxmark folder – Settings → Select Proxmark folder… and point to the root directory that contains the client subfolder.
+Select Proxmark folder – go to Settings → Select Proxmark folder… and point to the root directory that contains the client subfolder.
 
 Choose COM port – the upper‑left combo box lists real system ports. Press 🔄 to refresh.
 
@@ -67,7 +69,7 @@ Execute a command – double‑click a leaf command in the tree. The options pan
 
 Manual input – type any command in the “Manual command” field and press ▶ or Enter.
 
-Open console – the cmd button launches pm3.bat in a separate window and automatically types the manual command (without executing it). Just press Enter to run.
+Open console – the cmd button launches pm3.bat in a separate window and automatically types the manual command (without executing it). Just press Enter to run. After closing the console, the GUI automatically restarts the connection when you send the next command.
 
 ⚙️ Settings & Cache
 All data is stored in your Windows home directory (C:\Users\<username>\):
@@ -94,11 +96,14 @@ Horizontal tree scrollbar is inactive
 "cmd" button does not start pm3.bat
 → Verify that pm3.bat exists in the chosen Proxmark root folder. The launch uses that folder as the working directory.
 
+After closing external console, commands don't send
+→ The GUI now automatically restarts the connection on the next command submission. If it still fails, check that the COM port is not locked by another process.
+
 🏗 Project Structure
 text
 proxmark3-gui-commander/
-├── pm3_gui.py             # main application file
-├── screenshots/           # screenshots for README
+├── pm3_gui.py               # main application file
+├── screenshots/             # screenshots for README
 ├── README.md
 └── .gitignore
 🤝 Contributing
@@ -116,4 +121,3 @@ All testers and contributors who helped polish this tool.
 
 Proxmark3 GUI Commander – your personal assistant in the RFID world.
 Try it and forget about the command line!
-
