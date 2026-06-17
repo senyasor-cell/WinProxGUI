@@ -25,7 +25,6 @@ def load_config():
         "encoding": "utf-8",
         "last_path": "",
         "last_full_command": "",
-        "append_exit": False
     }
     try:
         if os.path.exists(get_user_path(CONFIG_FILENAME)):
@@ -100,74 +99,6 @@ def get_available_com_ports():
         pass
     return sorted(ports, key=lambda x: int(re.search(r'\d+', x).group()))
 
-# ----------------------------- Proxmark Batch (for help) -----------------------------
-class ProxmarkBatch:
-    def __init__(self, client_folder, com_port, encoding='utf-8'):
-        self.client_folder = client_folder
-        self.com_port = com_port
-        self.encoding = encoding
-        self.lock = threading.Lock()
-
-    def _find_proxmark_exe(self):
-        exe = os.path.join(self.client_folder, "client", "proxmark3.exe")
-        if os.path.isfile(exe):
-            return exe
-        exe = os.path.join(self.client_folder, "client", "build", "proxmark3.exe")
-        if os.path.isfile(exe):
-            return exe
-        return None
-
-    def _build_environment(self):
-        env = os.environ.copy()
-        client_dir = os.path.join(self.client_folder, "client")
-        env['HOME'] = client_dir
-        qt_plugin_path = os.path.join(client_dir, "libs") + os.sep
-        env['QT_PLUGIN_PATH'] = qt_plugin_path
-        env['QT_QPA_PLATFORM_PLUGIN_PATH'] = qt_plugin_path
-        path_addition = qt_plugin_path + os.pathsep + os.path.join(qt_plugin_path.rstrip(os.sep), "shell")
-        if 'PATH' in env:
-            env['PATH'] = path_addition + os.pathsep + env['PATH']
-        else:
-            env['PATH'] = path_addition
-        env['MSYSTEM'] = 'MINGW64'
-        return env
-
-    def run_command_batch(self, cmd, timeout=30):
-        with self.lock:
-            exe = self._find_proxmark_exe()
-            if not exe:
-                return "[ERROR] proxmark3.exe not found"
-            try:
-                cwd = os.path.join(self.client_folder, "client")
-                env = self._build_environment()
-                full_cmd_str = f"{cmd}; exit"
-                proc = subprocess.run(
-                    [exe, "-p", self.com_port, "-c", full_cmd_str],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding=self.encoding,
-                    errors='replace',
-                    cwd=cwd,
-                    env=env,
-                    timeout=timeout,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                )
-                return proc.stdout
-            except subprocess.TimeoutExpired:
-                return "[ERROR] Command timed out"
-            except Exception as e:
-                return f"[ERROR] {e}"
-
-    def get_help(self, base_path=""):
-        cmd_h = f"{base_path} -h" if base_path else "-h"
-        output = self.run_command_batch(cmd_h, timeout=60)
-        if not re.search(r'(options\s*:|usage\s*:)', output, re.IGNORECASE):
-            output2 = self.run_command_batch(f"{base_path} h", timeout=60)
-            if re.search(r'(options\s*:|usage\s*:)', output2, re.IGNORECASE):
-                output = output2
-        return output
-
 # ----------------------------- GUI Application -----------------------------
 class ProxmarkApp(tk.Tk):
     def __init__(self):
@@ -182,13 +113,22 @@ class ProxmarkApp(tk.Tk):
         self.encoding_var = tk.StringVar(value=config.get("encoding", "utf-8"))
         self.last_path = config.get("last_path", "")
         self.last_full_command = config.get("last_full_command", "")
-        self.append_exit_var = tk.BooleanVar(value=config.get("append_exit", False))
 
-        self.batch = None
+        # PTY related
         self.pty_process = None
+        self.connected = False
+        self.pty_lock = threading.Lock()
+        self._closing = threading.Event()
+
+        # Sync command helpers
+        self.output_buffer = []
+        self.sync_event = threading.Event()
+        self.sync_start_index = 0
+        self.sync_output = ""
+
+        # GUI components
         self.log_queue = queue.Queue()
         self.status_queue = queue.Queue()
-        self._closing = threading.Event()
         self.path_to_iid = {}
         self.tree_building = False
         self.wiegand_formats = []
@@ -204,16 +144,13 @@ class ProxmarkApp(tk.Tk):
         self.after(100, self._process_queues)
 
         if self.pm3_folder.get():
-            self.init_prox()
             cached = load_tree_cache(self.pm3_folder.get())
             if cached:
                 self.populate_tree_from_cache(cached)
                 self.status_var.set("Ready (cached tree)")
                 self.restore_last_state()
-                self._start_pty()
-                self.after(200, self.show_manual_input)
             else:
-                self.build_tree()
+                self.status_var.set("Not connected. Press Connect.")
 
     # ---------- Виджеты ----------
     def create_widgets(self):
@@ -223,21 +160,25 @@ class ProxmarkApp(tk.Tk):
         left_frame = ttk.Frame(main_paned)
         main_paned.add(left_frame, weight=1)
 
+        # Верхняя панель: COM Port, кнопка обновления, Connect
         com_frame = ttk.Frame(left_frame)
         com_frame.pack(fill=tk.X, padx=5, pady=(5,0))
         ttk.Label(com_frame, text="COM Port:").pack(side=tk.LEFT)
         self.com_combo = ttk.Combobox(com_frame, textvariable=self.com_port, state="readonly", width=10)
         self.com_combo.pack(side=tk.LEFT, padx=5)
-        self._update_combo_ports()
-        refresh_btn = ttk.Button(com_frame, text="\U0001F5D8", width=3, command=self.refresh_com_ports)
-        refresh_btn.pack(side=tk.LEFT)
+
+        self.connect_btn = ttk.Button(com_frame, text="Connect", width=10, command=self.toggle_connection)
+        self.connect_btn.pack(side=tk.LEFT, padx=5)
+        refresh_ports_btn = ttk.Button(com_frame, text="\U0001F5D8", width=3, command=self.refresh_com_ports)
+        refresh_ports_btn.pack(side=tk.RIGHT, padx=(0, 5))
+
         self.com_combo.bind("<<ComboboxSelected>>", self.on_com_port_changed)
 
         tree_header = ttk.Frame(left_frame)
         tree_header.pack(fill=tk.X, padx=5, pady=(5,0))
-        ttk.Label(tree_header, text="Command Tree", font=('TkDefaultFont', 10, 'bold')).pack(side=tk.LEFT)
+        ttk.Label(tree_header, text="Command Tree", font=('TkDefaultFont', 10, 'bold')).pack(side=tk.LEFT, padx=(0, 10))
         self.tree_refresh_btn = ttk.Button(tree_header, text="\U0001F5D8", width=3, command=self.build_tree)
-        self.tree_refresh_btn.pack(side=tk.RIGHT, padx=(0, 15))
+        self.tree_refresh_btn.pack(side=tk.RIGHT)
 
         tree_container = ttk.Frame(left_frame)
         tree_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -302,10 +243,244 @@ class ProxmarkApp(tk.Tk):
         self.status_var = tk.StringVar(value="Not connected")
         ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(fill=tk.X, side=tk.BOTTOM)
 
-    # ---------- Открытие cmd с освобождением порта ----------
+    # ---------- Управление подключением ----------
+    def toggle_connection(self):
+        if self.connected:
+            self.disconnect_pty()
+        else:
+            self.connect_pty()
+
+    def connect_pty(self):
+        if self.connected:
+            return
+        folder = self.pm3_folder.get()
+        if not folder or not os.path.isdir(os.path.join(folder, "client")):
+            messagebox.showerror("Error", "Proxmark folder not set or invalid.")
+            return
+
+        exe = os.path.join(folder, "client", "proxmark3.exe")
+        if not os.path.isfile(exe):
+            exe = os.path.join(folder, "client", "build", "proxmark3.exe")
+        if not os.path.isfile(exe):
+            messagebox.showerror("Error", "proxmark3.exe not found in client folder.")
+            return
+
+        env = os.environ.copy()
+        client_dir = os.path.join(folder, "client")
+        env['HOME'] = client_dir
+        qt_plugin_path = os.path.join(client_dir, "libs") + os.sep
+        env['QT_PLUGIN_PATH'] = qt_plugin_path
+        env['QT_QPA_PLATFORM_PLUGIN_PATH'] = qt_plugin_path
+        path_addition = qt_plugin_path + os.pathsep + os.path.join(qt_plugin_path.rstrip(os.sep), "shell")
+        if 'PATH' in env:
+            env['PATH'] = path_addition + os.pathsep + env['PATH']
+        else:
+            env['PATH'] = path_addition
+        env['MSYSTEM'] = 'MINGW64'
+
+        try:
+            self.pty_process = PtyProcess.spawn(
+                [exe, '-p', self.com_port.get(), '-w'],
+                cwd=client_dir,
+                env=env,
+                dimensions=(40, 120)
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start PTY: {e}")
+            return
+
+        self.connected = True
+        self.connect_btn.config(text="Disconnect")
+        self.status_var.set(f"Connected to {self.com_port.get()}")
+        self.status_queue.put(f"[INFO] Connected to {self.com_port.get()}")
+
+        with self.pty_lock:
+            self.output_buffer.clear()
+            self.sync_event.clear()
+
+        threading.Thread(target=self._pty_reader, daemon=True).start()
+
+        # Ждём появления первого промпта, чтобы буфер содержал всё приветствие
+        self.sync_event.wait(timeout=10)
+
+        # Теперь запускаем загрузку форматов (и дерево, если нужно)
+        threading.Thread(target=self._load_initial_data, daemon=True).start()
+
+        if not self.tree.get_children():
+            self.build_tree()
+
+    def disconnect_pty(self):
+        if not self.connected:
+            return
+        self.connected = False
+        if self.pty_process:
+            try:
+                self.pty_process.write("exit\n")
+                self.pty_process.close()
+            except:
+                pass
+            self.pty_process = None
+        self.sync_event.set()
+        self.after(0, self._update_connection_status)
+
+    def _update_connection_status(self):
+        if self._closing.is_set() or not self.winfo_exists():
+            return
+        self.connected = False
+        self.pty_process = None
+        self.connect_btn.config(text="Connect")
+        self.status_var.set("Disconnected")
+        self.status_queue.put("[INFO] Pseudo‑terminal closed.")
+
+    def _pty_reader(self):
+        try:
+            while not self._closing.is_set() and self.connected and self.pty_process and self.pty_process.isalive():
+                data = self.pty_process.read(1024)
+                if data:
+                    lines = data.splitlines(keepends=True)
+                    with self.pty_lock:
+                        for line in lines:
+                            clean = re.sub(r'\x1b\[[0-9;]*m', '', line)
+                            self.output_buffer.append(clean)
+                            self.log_queue.put(clean)
+                            if clean.strip().endswith("pm3 -->") or clean.strip().endswith("pm3 #"):
+                                self.sync_event.set()
+        except EOFError:
+            pass
+        except Exception as e:
+            self.log_queue.put(f"[ERROR] PTY reader: {e}\n")
+        finally:
+            if not self._closing.is_set():
+                self.after(0, self._update_connection_status)
+            self.sync_event.set()
+
+    # ---------- Синхронное выполнение команд через PTY ----------
+    def execute_command_sync(self, command, timeout=30):
+        if not self.connected or not self.pty_process or not self.pty_process.isalive():
+            return "[ERROR] Not connected."
+
+        with self.pty_lock:
+            self.sync_event.clear()
+            start_idx = len(self.output_buffer)
+            self.pty_process.write(command + "\n")
+        self.sync_event.wait(timeout)
+
+        with self.pty_lock:
+            end_idx = len(self.output_buffer)
+            if self.sync_event.is_set():
+                prompt_idx = -1
+                for i in range(end_idx - 1, start_idx - 1, -1):
+                    line = self.output_buffer[i].strip()
+                    if line.endswith("pm3 -->") or line.endswith("pm3 #"):
+                        prompt_idx = i
+                        break
+                if prompt_idx != -1:
+                    result = ''.join(self.output_buffer[start_idx:prompt_idx])
+                else:
+                    result = ''.join(self.output_buffer[start_idx:end_idx])
+            else:
+                result = ''.join(self.output_buffer[start_idx:end_idx])
+            return result
+
+    # ---------- Загрузка Wiegand форматов ----------
+    def _load_initial_data(self):
+        output = self.execute_command_sync("wiegand list", timeout=15)
+        self._parse_wiegand(output)
+
+    def _parse_wiegand(self, output):
+        formats = []
+        lines = output.splitlines()
+        start = -1
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('[=]') and '----' in stripped:
+                start = i + 1
+                break
+        if start == -1:
+            self.wiegand_formats = formats
+            self.wiegand_loaded.set()
+            self.status_queue.put(f"[INFO] Loaded {len(formats)} Wiegand formats.")
+            return
+        for line in lines[start:]:
+            stripped = line.strip()
+            if not stripped.startswith('[=]'):
+                continue
+            token = stripped[3:].strip()
+            if not token:
+                continue
+            if token.strip('-') == '':
+                continue
+            parts = token.split(None, 1)
+            if len(parts) < 2:
+                continue
+            name = parts[0]
+            desc = parts[1].strip()
+            if name == "Name" and desc == "Description":
+                continue
+            formats.append((name, desc))
+        self.wiegand_formats = formats
+        self.wiegand_loaded.set()
+        self.status_queue.put(f"[INFO] Loaded {len(formats)} Wiegand formats.")
+
+    # ---------- Построение дерева через PTY ----------
+    def build_tree(self):
+        if self.tree_building:
+            return
+        if not self.connected:
+            messagebox.showerror("Error", "Not connected. Press Connect first.")
+            return
+
+        self.tree_building = True
+        self.status_var.set("Building tree...")
+        self.tree.delete(*self.tree.get_children())
+        self.path_to_iid.clear()
+        folder = self.pm3_folder.get()
+        threading.Thread(target=self._tree_builder_thread, args=(folder,), daemon=True).start()
+        self.show_manual_input()
+
+    def _tree_builder_thread(self, folder):
+        self.wiegand_loaded.wait(timeout=10)
+        tree_data = []
+        self._build_node('', tree_data)
+        self.tree_building = False
+        self.after(0, lambda: self.status_var.set("Ready"))
+        save_tree_cache(folder, tree_data)
+        self.after(100, self.restore_last_state)
+        self.after(600, self.show_manual_input)
+
+    def _build_node(self, base_path, parent_list):
+        cmd = f"{base_path} -h" if base_path else "-h"
+        output = self.execute_command_sync(cmd, timeout=60)
+        if not output:
+            return
+        output_clean = self.clean_text(output)
+        self.log_queue.put(f"[CMD] {cmd}\n")
+        self.log_queue.put(output_clean + "\n")
+        commands = self.parse_help_output(output_clean)
+        for name, desc, is_folder in commands:
+            full_path = f"{base_path} {name}".strip()
+            node = {"name": name, "path": full_path, "desc": desc, "children": []}
+            self.after(0, self._add_tree_node, base_path, name, full_path, desc)
+            if is_folder:
+                self._build_node(full_path, node["children"])
+            parent_list.append(node)
+
+    # ---------- Отправка команд в PTY ----------
+    def run_manual_command(self, cmd):
+        if not self.connected or not self.pty_process or not self.pty_process.isalive():
+            self.status_queue.put("[ERROR] Not connected.")
+            return
+        self.status_var.set(f"Running: {cmd}")
+        self.status_queue.put(f"[EXEC] {cmd}")
+        with self.pty_lock:
+            self.pty_process.write(cmd + "\n")
+
+    # ---------- Открытие внешней консоли ----------
     def open_cmd(self):
-        self.stop_pty()
-        time.sleep(0.3)  # даём время на освобождение порта
+        self.show_manual_input()
+        if self.connected:
+            self.disconnect_pty()
+            time.sleep(0.3)
 
         folder = self.pm3_folder.get()
         if not folder or not os.path.isdir(folder):
@@ -351,170 +526,7 @@ class ProxmarkApp(tk.Tk):
                 break
         self.after(100, self._process_queues)
 
-    # ---------- Инициализация ----------
-    def init_prox(self):
-        if self.pm3_folder.get() and os.path.isdir(os.path.join(self.pm3_folder.get(), "client")):
-            self.status_queue.put(f"[INFO] Connecting to {self.com_port.get()}...")
-            self.batch = ProxmarkBatch(self.pm3_folder.get(), self.com_port.get(), self.encoding_var.get())
-            threading.Thread(target=self._load_initial_data, daemon=True).start()
-            self.status_var.set("Connected")
-        else:
-            self.batch = None
-            self.status_var.set("Folder not set")
-
-    def _load_initial_data(self):
-        output = self.batch.run_command_batch("wiegand list", timeout=15)
-        self._parse_wiegand(output)
-
-    def _start_pty(self):
-        """Запускает PTY, возвращает True при успехе."""
-        if self.pty_process and self.pty_process.isalive():
-            return True
-        exe = os.path.join(self.pm3_folder.get(), "client", "proxmark3.exe")
-        if not os.path.isfile(exe):
-            exe = os.path.join(self.pm3_folder.get(), "client", "build", "proxmark3.exe")
-        if not os.path.isfile(exe):
-            self.status_queue.put("[ERROR] proxmark3.exe not found")
-            return False
-        env = self.batch._build_environment()
-        try:
-            self.pty_process = PtyProcess.spawn(
-                [exe, '-p', self.com_port.get(), '-w'],
-                cwd=os.path.join(self.pm3_folder.get(), "client"),
-                env=env,
-                dimensions=(40, 120)
-            )
-            self.status_queue.put("[INFO] Pseudo‑terminal started.")
-            threading.Thread(target=self._pty_reader, daemon=True).start()
-            return True
-        except Exception as e:
-            self.status_queue.put(f"[ERROR] Failed to start pty: {e}")
-            self.pty_process = None
-            return False
-
-    def _parse_wiegand(self, output):
-        formats = []
-        lines = output.splitlines()
-        start = -1
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith('[=]') and '----' in stripped:
-                start = i + 1
-                break
-        if start > 0:
-            for line in lines[start:]:
-                stripped = line.strip()
-                if not stripped.startswith('[=]'):
-                    continue
-                token = stripped[3:].strip()
-                if token:
-                    parts = token.split(None, 1)
-                    name = parts[0]
-                    desc = parts[1] if len(parts) > 1 else ""
-                    formats.append((name, desc))
-        self.wiegand_formats = formats
-        self.wiegand_loaded.set()
-        self.status_queue.put(f"[INFO] Loaded {len(formats)} Wiegand formats.")
-
-    def _pty_reader(self):
-        try:
-            while not self._closing.is_set() and self.pty_process and self.pty_process.isalive():
-                data = self.pty_process.read(1024)
-                if data:
-                    for line in data.splitlines(keepends=True):
-                        clean = re.sub(r'\x1b\[[0-9;]*m', '', line)
-                        self.log_queue.put(clean)
-        except EOFError:
-            pass
-        except Exception as e:
-            self.log_queue.put(f"[ERROR] PTY reader: {e}\n")
-        finally:
-            self.pty_process = None
-            self.status_queue.put("[INFO] Pseudo‑terminal closed.")
-
-    def _pty_write(self, text):
-        if self.pty_process and self.pty_process.isalive():
-            try:
-                self.pty_process.write(text)
-            except Exception as e:
-                self.status_queue.put(f"[ERROR] PTY write: {e}")
-
-    def run_manual_command(self, cmd):
-        # Если PTY не активен, пытаемся перезапустить
-        if not self.pty_process or not self.pty_process.isalive():
-            self.status_queue.put("[INFO] PTY not running, attempting to restart...")
-            if not self._start_pty():
-                self.status_queue.put("[ERROR] Failed to restart PTY. Check COM port.")
-                return
-            # Небольшая задержка для инициализации
-            time.sleep(0.5)
-            if not self.pty_process or not self.pty_process.isalive():
-                self.status_queue.put("[ERROR] PTY still not running.")
-                return
-        self.status_var.set(f"Running: {cmd}")
-        self.status_queue.put(f"[EXEC] {cmd}")
-        self._pty_write(cmd + "\n")
-
-    def stop_pty(self):
-        if self.pty_process:
-            try:
-                self.pty_process.write("exit\n")
-                self.pty_process.close()
-            except:
-                pass
-            self.pty_process = None
-
-    # ---------- Построение дерева ----------
-    def build_tree(self):
-        if self.tree_building:
-            return
-        if not self.batch:
-            messagebox.showerror("Error", "Сначала выберите папку Proxmark.")
-            return
-        pty_was_active = False
-        if self.pty_process and self.pty_process.isalive():
-            self.stop_pty()
-            self.status_queue.put("[INFO] PTY stopped temporarily for tree rebuild.")
-            pty_was_active = True
-        self.tree_building = True
-        self.status_var.set("Building tree...")
-        self.tree.delete(*self.tree.get_children())
-        self.path_to_iid.clear()
-        folder = self.pm3_folder.get()
-        threading.Thread(target=self._tree_builder_thread, args=(folder, pty_was_active), daemon=True).start()
-        self.show_manual_input()
-
-    def _tree_builder_thread(self, folder, pty_was_active):
-        self.wiegand_loaded.wait(timeout=10)
-        tree_data = []
-        self._build_node('', tree_data)
-        self.tree_building = False
-        self.after(0, lambda: self.status_var.set("Ready"))
-        save_tree_cache(folder, tree_data)
-        self.after(100, self.restore_last_state)
-        if pty_was_active:
-            self.after(500, self._start_pty)
-        else:
-            self.after(500, self._start_pty)
-        self.after(600, self.show_manual_input)
-
-    def _build_node(self, base_path, parent_list):
-        output = self.batch.get_help(base_path)
-        if not output:
-            return
-        output_clean = self.clean_text(output)
-        self.log_queue.put(f"[CMD] {base_path} -h\n")
-        self.log_queue.put(output_clean + "\n")
-        commands = self.parse_help_output(output_clean)
-        for name, desc, is_folder in commands:
-            full_path = f"{base_path} {name}".strip()
-            node = {"name": name, "path": full_path, "desc": desc, "children": []}
-            self.after(0, self._add_tree_node, base_path, name, full_path, desc)
-            if is_folder:
-                self._build_node(full_path, node["children"])
-            parent_list.append(node)
-
-    # ---------- Управление панелью опций ----------
+    # ---------- Панель опций ----------
     def show_manual_input(self):
         for widget in self.options_frame.winfo_children():
             widget.destroy()
@@ -527,7 +539,8 @@ class ProxmarkApp(tk.Tk):
             pass
 
     def load_command_options(self, command_path):
-        if not self.batch:
+        if not self.connected:
+            self.status_queue.put("[ERROR] Not connected.")
             return
         if not self.wiegand_loaded.is_set():
             self.status_queue.put("[WARN] Wiegand formats still loading...")
@@ -537,12 +550,6 @@ class ProxmarkApp(tk.Tk):
         for widget in self.options_frame.winfo_children():
             widget.destroy()
         self.option_widgets = {}
-
-        pty_was_active = False
-        if self.pty_process and self.pty_process.isalive():
-            self.stop_pty()
-            self.status_queue.put("[INFO] PTY stopped temporarily for help query.")
-            pty_was_active = True
 
         self.right_paned.insert(0, self.options_frame)
         self.right_paned.pane(self.options_frame, weight=0)
@@ -579,19 +586,16 @@ class ProxmarkApp(tk.Tk):
         self.status_label.pack(pady=5)
 
         self.update_manual(command_path)
-        threading.Thread(target=self._load_options_thread, args=(command_path, saved, pty_was_active), daemon=True).start()
+        threading.Thread(target=self._load_options_thread, args=(command_path, saved), daemon=True).start()
 
-    def _load_options_thread(self, command_path, saved_options, pty_was_active):
-        try:
-            output = self.batch.get_help(command_path)
-        except Exception as e:
-            self.after(0, self._show_error, f"Failed to get help: {e}")
-            if pty_was_active:
-                self.after(500, self._start_pty)
+    def _load_options_thread(self, command_path, saved_options):
+        output = self.execute_command_sync(f"{command_path} -h", timeout=60)
+        if output is None:
+            self.after(0, self._show_error, "Failed to get help (timeout).")
             return
-        self.after(0, self._process_options_help, output, saved_options, pty_was_active)
+        self.after(0, self._process_options_help, output, saved_options)
 
-    def _process_options_help(self, output, saved_options, pty_was_active):
+    def _process_options_help(self, output, saved_options):
         output = self.clean_text(output)
         lines = output.splitlines()
         opts_start = -1
@@ -646,8 +650,6 @@ class ProxmarkApp(tk.Tk):
 
         if opts_start == -1:
             self._show_error("Options section not found.")
-            if pty_was_active:
-                self.after(500, self._start_pty)
             return
 
         option_lines = []
@@ -694,8 +696,6 @@ class ProxmarkApp(tk.Tk):
                         var.set(str(saved_val))
         self.update_manual(self.build_command())
         self.status_label.config(text="Ready")
-        if pty_was_active:
-            self.after(500, self._start_pty)
 
     # ---------- Остальные методы ----------
     def _create_option_widget(self, parent, flag, alias, opt_type, desc):
@@ -849,10 +849,8 @@ class ProxmarkApp(tk.Tk):
         full_path = selection[0]
         if self.tree.get_children(selection[0]):
             return
-        if not self.batch:
-            return
-        if not self.wiegand_loaded.is_set():
-            self.status_queue.put("[WARN] Wiegand formats still loading...")
+        if not self.connected:
+            self.status_queue.put("[WARN] Not connected. Press Connect first.")
             return
         self.load_command_options(full_path)
 
@@ -863,32 +861,26 @@ class ProxmarkApp(tk.Tk):
         full_path = selection[0]
         if self.tree.get_children(selection[0]):
             return
-        if not self.batch:
-            return
-        if not self.wiegand_loaded.is_set():
-            self.status_queue.put("[WARN] Wiegand formats still loading...")
+        if not self.connected:
+            self.status_queue.put("[WARN] Not connected. Press Connect first.")
             return
         self.load_command_options(full_path)
 
-    def _update_combo_ports(self):
+    def refresh_com_ports(self):
         ports = get_available_com_ports()
         self.com_combo['values'] = ports
         if self.com_port.get() not in ports and ports:
             self.com_port.set(ports[0])
-
-    def refresh_com_ports(self):
-        self._update_combo_ports()
         self.status_queue.put("[INFO] COM port list refreshed.")
 
     def on_com_port_changed(self, event=None):
         new_port = self.com_port.get()
-        self.status_queue.put(f"[INFO] COM port changed to {new_port}. Reconnecting...")
+        self.status_queue.put(f"[INFO] COM port changed to {new_port}.")
         self.save_current_config()
-        self.init_prox()
-
-    def on_append_exit_changed(self):
-        # Оставлен для совместимости, но не используется
-        pass
+        if self.connected:
+            self.status_queue.put("[INFO] Disconnecting and reconnecting with new port...")
+            self.disconnect_pty()
+            self.connect_pty()
 
     def create_menu(self):
         menubar = tk.Menu(self)
@@ -900,7 +892,6 @@ class ProxmarkApp(tk.Tk):
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="Select Proxmark folder...", command=self.select_folder)
-        # Пункт "Append exit" удалён
         enc_menu = tk.Menu(settings_menu, tearoff=0)
         encodings = [
             ("UTF-8", "utf-8"), ("CP1251 (Windows Cyrillic)", "cp1251"),
@@ -914,7 +905,7 @@ class ProxmarkApp(tk.Tk):
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "Proxmark3 GUI Commander vFinal\nFixed layout."))
+        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "Proxmark3 GUI Commander v2\nSingle PTY session."))
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Select Proxmark root folder (contains 'client' subfolder)")
@@ -925,8 +916,17 @@ class ProxmarkApp(tk.Tk):
             self.pm3_folder.set(folder)
             self.status_queue.put(f"[INFO] Selected folder: {folder}")
             self.save_current_config()
-            self.init_prox()
-            self.build_tree()
+            if self.connected:
+                self.disconnect_pty()
+                self.connect_pty()
+            else:
+                cached = load_tree_cache(folder)
+                if cached:
+                    self.tree.delete(*self.tree.get_children())
+                    self.path_to_iid.clear()
+                    self.populate_tree_from_cache(cached)
+                    self.status_var.set("Ready (cached tree)")
+                    self.restore_last_state()
 
     def save_current_config(self):
         config = {
@@ -935,15 +935,15 @@ class ProxmarkApp(tk.Tk):
             "encoding": self.encoding_var.get(),
             "last_path": self.last_path,
             "last_full_command": self.last_full_command,
-            "append_exit": self.append_exit_var.get()
         }
         save_config(config)
 
     def on_encoding_changed(self):
-        self.status_queue.put(f"[INFO] Encoding changed to {self.encoding_var.get()}. Reinit.")
+        self.status_queue.put(f"[INFO] Encoding changed to {self.encoding_var.get()}. Reconnect to apply.")
         self.save_current_config()
-        self.init_prox()
-        self.build_tree()
+        if self.connected:
+            self.disconnect_pty()
+            self.connect_pty()
 
     def clean_text(self, text):
         ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
@@ -1089,8 +1089,8 @@ class ProxmarkApp(tk.Tk):
             self.status_text.see('1.0')
 
     def on_closing(self):
-        self.stop_pty()
         self._closing.set()
+        self.disconnect_pty()
         self.last_full_command = self.cmd_entry.get().strip()
         self.save_current_config()
         self.destroy()
