@@ -1,24 +1,4 @@
 markdown
-### 2. Installation
-
-Clone the repository or download the ZIP archive:
-
-```bash
-git clone https://github.com/senyasor-cell/WinProxGUI
-cd WinProxGUI
-Install the only external dependency – winpty (required for pseudo‑terminal support on Windows):
-
-bash
-pip install winpty
-All other dependencies are part of the standard Python library (tkinter, subprocess, threading, json, re, etc.) – no extra installations needed.
-
-text
-
-Полностью исправленный файл README.md с этой правкой приведён ниже. Остальные разделы остались без изменений.
-
----
-
-```markdown
 # Proxmark3 GUI Commander
 
 A modern graphical interface for Proxmark3 on Windows.  
