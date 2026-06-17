@@ -26,10 +26,11 @@ Forget the command line — all commands, options, examples, and formats are now
 - **Real‑time log output** – all Proxmark3 output appears line‑by‑line in the black Session Log.
 - **Separate status panel** – system messages (`[EXEC]`, errors, `[USAGE]`) are shown in a yellow area and don’t clutter the log.
 - **"cmd" button** – opens a regular command prompt with `pm3.bat` running and automatically types the manual command (without executing it). The COM port is released before launch and automatically re‑acquired when you send commands from the GUI afterwards.
+- **Single PTY session** – all communication with Proxmark3 goes through a single pseudo‑terminal, eliminating port conflicts and making command execution faster.
+- **Connect/Disconnect control** – you decide when to open the COM port; the port stays locked while connected and is released only on disconnect or when using the "cmd" button.
 - **Automatic PTY restart** – if the pseudo‑terminal is stopped (e.g., after closing an external console), it restarts on the next command submission.
 - **Tree caching** – after the first scan the tree is saved as JSON and loads instantly on subsequent launches.
 - **All settings preserved** – Proxmark folder, COM port, encoding, and last command are restored automatically.
-- **Batch execution mode** – every command runs as a separate `proxmark3.exe -c "command; exit"` process, avoiding port hangs and conflicts.
 - **Configurable encoding** – choose UTF‑8, CP1251, CP866, etc., for correct Cyrillic display.
 
 ---
@@ -60,20 +61,24 @@ All other dependencies are part of the standard Python library (tkinter, subproc
 3. Launch
 bash
 python pm3_gui.py
-On first launch the program will ask you to select the Proxmark folder (Settings → Select Proxmark folder). After that, Wiegand formats, hardware version, and the command tree will load automatically.
+On first launch the program will ask you to select the Proxmark folder (Settings → Select Proxmark folder). After that, Wiegand formats and the command tree will load automatically once you press Connect.
 
 🧭 How to Use
 Select Proxmark folder – go to Settings → Select Proxmark folder… and point to the root directory that contains the client subfolder.
 
-Choose COM port – the upper‑left combo box lists real system ports. Press 🔄 to refresh.
+Choose COM port – the upper‑left combo box lists real system ports. Press 🔄 (right side of the port line) to refresh.
 
-Load the tree – press 🔄 next to “Command Tree” or wait for automatic loading from cache.
+Connect – press the Connect button to open the COM port and start the PTY session. The button will change to Disconnect.
+
+Load the tree – press 🔄 next to “Command Tree” (right side of the tree header) or wait for automatic loading from cache.
 
 Execute a command – double‑click a leaf command in the tree. The options panel appears. Configure the parameters and press ▶ (Send). The command runs and the output appears in the Session Log.
 
 Manual input – type any command in the “Manual command” field and press ▶ or Enter.
 
 Open console – the cmd button launches pm3.bat in a separate window and automatically types the manual command (without executing it). Just press Enter to run. After closing the console, the GUI automatically restarts the connection when you send the next command.
+
+Disconnect – press Disconnect to release the COM port manually. You can reconnect anytime.
 
 ⚙️ Settings & Cache
 All data is stored in your Windows home directory (C:\Users\<username>\):
@@ -89,7 +94,7 @@ To reset the settings, simply delete these files (the program will recreate them
 → Make sure the selected folder contains a client subfolder with proxmark3.exe.
 
 "ERROR: invalid serial port COM9"
-→ The port is busy or Proxmark3 is unresponsive. Close all other console windows with pm3 and try again.
+→ The port is busy or Proxmark3 is unresponsive. Close all other console windows with pm3, press Disconnect (if connected), and try again.
 
 Command tree is empty / options are blank
 → Press 🔄 next to “Command Tree” to force a full rebuild. Ensure that Proxmark3 is connected and recognised by the system.
@@ -101,7 +106,10 @@ Horizontal tree scrollbar is inactive
 → Verify that pm3.bat exists in the chosen Proxmark root folder. The launch uses that folder as the working directory.
 
 After closing external console, commands don't send
-→ The GUI now automatically restarts the connection on the next command submission. If it still fails, check that the COM port is not locked by another process.
+→ The GUI automatically restarts the connection on the next command submission. If it still fails, check that the COM port is not locked by another process.
+
+"Connect" button does nothing
+→ Make sure you have selected a valid Proxmark folder with client/proxmark3.exe. The button will only work when the folder is set.
 
 🏗 Project Structure
 text
