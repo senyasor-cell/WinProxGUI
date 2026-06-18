@@ -60,7 +60,7 @@ All other dependencies are part of the standard Python library (tkinter, subproc
 
 3. Launch
 bash
-python pm3_gui.py
+python pm3.py
 On first launch the program will ask you to select the Proxmark folder (Settings → Select Proxmark folder). After that, Wiegand formats and the command tree will load automatically once you press Connect.
 
 🧭 How to Use
@@ -114,7 +114,7 @@ After closing external console, commands don't send
 🏗 Project Structure
 text
 proxmark3-gui-commander/
-├── pm3_gui.py               # main application file
+├── pm3.py               # main application file
 ├── screenshots/             # screenshots for README
 ├── README.md
 └── .gitignore
